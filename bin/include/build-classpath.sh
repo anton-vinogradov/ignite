@@ -78,6 +78,6 @@ includeToClassPath() {
 includeToClassPath modules
 
 #
-# Include target libraries for opensourse modules to classpath.
+# Include target libraries for open source modules to classpath.
 #
 includeToClassPath "${IGNITE_HOME}"/modules

@@ -88,3 +88,4 @@ packages
 *.pyc
 /tests/venv
 modules/ducktests/tests/docker/build/**
+modules/**/__pycache__

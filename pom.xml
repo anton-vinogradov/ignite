@@ -104,6 +104,7 @@
                 <module>modules/benchmarks</module>
                 <module>modules/compatibility</module>
                 <module>modules/ducktests</module>
+                <module>modules/integration-tests</module>
                 <module>modules/geospatial</module>
                 <module>modules/hibernate-4.2</module>
                 <module>modules/hibernate-5.1</module>
@@ -138,6 +139,13 @@
             <id>ducktests</id>
             <modules>
                 <module>modules/ducktests</module>
+            </modules>
+        </profile>
+
+        <profile>
+            <id>integration-tests</id>
+            <modules>
+                <module>modules/integration-tests</module>
             </modules>
         </profile>
 
