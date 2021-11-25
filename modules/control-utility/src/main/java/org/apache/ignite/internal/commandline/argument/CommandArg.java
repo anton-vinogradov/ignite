@@ -25,4 +25,5 @@ public interface CommandArg {
      * @return Argument name.
      */
     String argName();
+    // test
 }
