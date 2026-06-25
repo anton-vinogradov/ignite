@@ -35,44 +35,50 @@ class SBLengthLimit {
     /** Length of head part of message. */
     private static final int HEAD_LEN = MAX_TO_STR_LEN - TAIL_LEN;
 
+    /** */
+    private int len;
+
     /**
-     * @param sb String builder.
-     * @param writtenLen Written length.
+     * @return Current length.
      */
-    void onWrite(SBLimitedLength sb, int writtenLen) {
-        if (overflowed(sb) && (sb.getTail() == null || sb.getTail().length() == 0)) {
-            CircularStringBuilder tail = createTail();
-            int newSbLen = Math.min(sb.length(), getHeadLengthLimit());
-            tail.append(sb.impl().substring(newSbLen));
-            sb.setTail(tail);
-            sb.impl().setLength(newSbLen);
-        }
-    }
-
-    /** Creates empty tail
-     * @return empty tail */
-    CircularStringBuilder createTail() {
-        return new CircularStringBuilder(getTailLengthLimit());
-    }
-
-    /**
-     * @return {@code True} if this string builder exceeds limit, false otherwise
-     */
-    boolean overflowed(SBLimitedLength sb) {
-        return sb.length() >= getHeadLengthLimit();
-    }
-
-    /**
-     * Returns max available head length
-     * @return head limit */
-    int getHeadLengthLimit() {
-        return HEAD_LEN;
+    int length() {
+        return len;
     }
 
     /**
      *
      */
-    int getTailLengthLimit() {
-        return TAIL_LEN;
+    void reset() {
+        len = 0;
+    }
+
+    /**
+     * @param sb String builder.
+     * @param writtenLen Written length.
+     */
+    void onWrite(SBLimitedLength sb, int writtenLen) {
+        len += writtenLen;
+
+        if (overflowed(sb) && (sb.getTail() == null || sb.getTail().length() == 0)) {
+            CircularStringBuilder tail = getTail();
+
+            int newSbLen = Math.min(sb.length(), HEAD_LEN + 1);
+            tail.append(sb.impl().substring(newSbLen));
+
+            sb.setTail(tail);
+            sb.setLength(newSbLen);
+        }
+    }
+
+    /** */
+    CircularStringBuilder getTail() {
+        return new CircularStringBuilder(TAIL_LEN);
+    }
+
+    /**
+     * @return {@code True} if reached limit.
+     */
+    boolean overflowed(SBLimitedLength sb) {
+        return sb.impl().length() > HEAD_LEN;
     }
 }

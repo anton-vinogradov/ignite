@@ -17,32 +17,11 @@
 
 package org.apache.ignite.internal.util.tostring;
 
-import org.apache.ignite.internal.util.CommonUtils;
+import java.util.Arrays;
 import org.apache.ignite.internal.util.GridStringBuilder;
 
 /**
- * A specialized string builder that enforces a maximum length limit
- * by splitting the content into two parts:
- * <ol>
- *   <li><b>Head:</b> The main buffer managed by the parent {@link GridStringBuilder}.
- *   Its size is constrained by a provided {@link SBLengthLimit}.</li>
- *   <li><b>Tail:</b> An auxiliary {@link CircularStringBuilder}
- *   that stores any overflow data once the head reaches its capacity.</li>
- * </ol>
  *
- * <p>This class overrides all mutating methods to redirect new data to the tail
- * when the length limit is exceeded, effectively making it an "append-only" structure
- * for the head buffer once the limit is reached.
- *
- * <p><strong>Important Behavior:</strong>
- * All operations that can reduce or delete characters from the head buffer
- * will throw an {@link UnsupportedOperationException}.
- * This design decision ensures the integrity of the length-limited head
- * and simplifies internal logic.
- *
- * <p>The {@code toString()} method provides
- * a unified representation of both head and tail contents,
- * optionally indicating skipped characters between them.
  */
 public class SBLimitedLength extends GridStringBuilder {
     /** */
@@ -66,6 +45,21 @@ public class SBLimitedLength extends GridStringBuilder {
      */
     void initLimit(SBLengthLimit lenLimit) {
         this.lenLimit = lenLimit;
+
+        if (tail != null)
+            tail.reset();
+    }
+
+    /**
+     * Resets buffer.
+     */
+    public void reset() {
+        super.setLength(0);
+
+        lenLimit.reset();
+
+        if (tail != null)
+            tail.reset();
     }
 
     /**
@@ -96,7 +90,6 @@ public class SBLimitedLength extends GridStringBuilder {
 
     /** {@inheritDoc} */
     @Override public GridStringBuilder a(Object obj) {
-        obj = GridToStringNode.recoverObject(obj);
         if (lenLimit.overflowed(this)) {
             tail.append(obj);
             return this;
@@ -104,14 +97,13 @@ public class SBLimitedLength extends GridStringBuilder {
 
         int curLen = length();
 
-        impl().append(obj);
+        super.a(obj);
 
         return onWrite(curLen);
     }
 
     /** {@inheritDoc} */
     @Override public GridStringBuilder a(String str) {
-        str = GridToStringNode.recoverObject(str);
         if (lenLimit.overflowed(this)) {
             tail.append(str);
             return this;
@@ -119,7 +111,7 @@ public class SBLimitedLength extends GridStringBuilder {
 
         int curLen = length();
 
-        impl().append(str);
+        super.a(str);
 
         return onWrite(curLen);
     }
@@ -140,7 +132,6 @@ public class SBLimitedLength extends GridStringBuilder {
 
     /** {@inheritDoc} */
     @Override public GridStringBuilder a(CharSequence s) {
-        s = GridToStringNode.recoverObject(s);
         if (lenLimit.overflowed(this)) {
             tail.append(s);
             return this;
@@ -148,14 +139,13 @@ public class SBLimitedLength extends GridStringBuilder {
 
         int curLen = length();
 
-        impl().append(s);
+        super.a(s);
 
         return onWrite(curLen);
     }
 
     /** {@inheritDoc} */
     @Override public GridStringBuilder a(CharSequence s, int start, int end) {
-        s = GridToStringNode.recoverObject(s);
         if (lenLimit.overflowed(this)) {
             tail.append(s.subSequence(start, end));
             return this;
@@ -163,21 +153,37 @@ public class SBLimitedLength extends GridStringBuilder {
 
         int curLen = length();
 
-        impl().append(s, start, end);
+        super.a(s, start, end);
 
         return onWrite(curLen);
     }
 
     /** {@inheritDoc} */
-    @Override public GridStringBuilder a(char[] arr) {
-        String str = new String(arr);
-        return a(str);
+    @Override public GridStringBuilder a(char[] str) {
+        if (lenLimit.overflowed(this)) {
+            tail.append(str);
+            return this;
+        }
+
+        int curLen = length();
+
+        super.a(str);
+
+        return onWrite(curLen);
     }
 
     /** {@inheritDoc} */
-    @Override public GridStringBuilder a(char[] arr, int offset, int len) {
-        String str = new String(arr, offset, len);
-        return a(str);
+    @Override public GridStringBuilder a(char[] str, int offset, int len) {
+        if (lenLimit.overflowed(this)) {
+            tail.append(Arrays.copyOfRange(str, offset, len));
+            return this;
+        }
+
+        int curLen = length();
+
+        super.a(str, offset, len);
+
+        return onWrite(curLen);
     }
 
     /** {@inheritDoc} */
@@ -265,124 +271,6 @@ public class SBLimitedLength extends GridStringBuilder {
     }
 
     /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int offset, String str) {
-        str = GridToStringNode.recoverObject(str);
-        int headLengthLimit = lenLimit.getHeadLengthLimit();
-        if (offset < headLengthLimit) {
-            impl().insert(offset, str);
-            if (lenLimit.overflowed(this)) {
-                String tailCandidate = impl().substring(headLengthLimit);
-                if (tail == null)
-                    tail = lenLimit.createTail();
-                tail.insert(0, tailCandidate);
-                impl().setLength(headLengthLimit);
-            }
-            return this;
-        }
-        tail.insert(offset - headLengthLimit, str);
-        return this;
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int idx, char[] str, int off, int len) {
-        StringBuilder strBuilder = new StringBuilder();
-        for (int i = 0; i < len; i++)
-            strBuilder.append(str[i + off]);
-        return i(idx, strBuilder.toString());
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, Object obj) {
-        return i(off, String.valueOf(obj));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, char[] str) {
-        return i(off, new String(str));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int dstOff, CharSequence s) {
-        s = GridToStringNode.recoverObject(s);
-        StringBuilder strBuilder = new StringBuilder();
-        for (int i = 0; i < s.length(); i++)
-            strBuilder.append(s.charAt(i));
-        return i(dstOff, strBuilder.toString());
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int dstOff, CharSequence s, int start, int end) {
-        s = GridToStringNode.recoverObject(s);
-        StringBuilder strBuilder = new StringBuilder();
-        for (int i = start; i < end; i++)
-            strBuilder.append(s.charAt(i));
-        return i(dstOff, strBuilder.toString());
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, boolean b) {
-        return super.i(off, String.valueOf(b));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, char c) {
-        return super.i(off, String.valueOf(c));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, int i) {
-        return super.i(off, String.valueOf(i));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, long l) {
-        return super.i(off, String.valueOf(l));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, float f) {
-        return super.i(off, String.valueOf(f));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder i(int off, double d) {
-        return super.i(off, String.valueOf(d));
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder d(int start, int end) {
-        throw new UnsupportedOperationException("Not supported by this implementation");
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder d(int idx) {
-        throw new UnsupportedOperationException("Not supported by this implementation");
-    }
-
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder r(int start, int end, String str) {
-        throw new UnsupportedOperationException("Not supported by this implementation");
-    }
-    
-    /** {@inheritDoc} */
-    @Override public GridStringBuilder nl() {
-        return a(CommonUtils.nl());
-    }
-
-    /** {@inheritDoc} */
-    @Override public int length() {
-        int length = super.length();
-        if (tail != null)
-            length += tail.getSkipped() + tail.length();
-        return length;
-    }
-
-    /** {@inheritDoc} */
-    @Override public void setLength(int len) {
-        throw new UnsupportedOperationException("setLength is not supported by this imlementation");
-    }
-
-    /** {@inheritDoc} */
     @Override public GridStringBuilder appendCodePoint(int codePoint) {
         if (lenLimit.overflowed(this)) {
             tail.append(codePoint);
@@ -394,6 +282,23 @@ public class SBLimitedLength extends GridStringBuilder {
         super.appendCodePoint(codePoint);
 
         return onWrite(curLen);
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * A mid-buffer insert (e.g. the identity hash from {@code GridToStringBuilder.handleRecursion})
+     * can push the head past the limit. Create the tail lazily here so a subsequent append in the
+     * overflow branch does not NPE on a {@code null} tail. The head is left intact (no extra
+     * truncation), so positions already recorded for recursion handling stay valid.
+     */
+    @Override public GridStringBuilder i(int off, String str) {
+        super.i(off, str);
+
+        if (tail == null && lenLimit.overflowed(this))
+            setTail(lenLimit.getTail());
+
+        return this;
     }
 
     /** {@inheritDoc} */
@@ -415,5 +320,12 @@ public class SBLimitedLength extends GridStringBuilder {
 
             return res.toString();
         }
+    }
+
+    /**
+     * @return {@code True} - if buffer limit is reached.
+     */
+    public boolean isOverflowed() {
+        return lenLimit.overflowed(this);
     }
 }

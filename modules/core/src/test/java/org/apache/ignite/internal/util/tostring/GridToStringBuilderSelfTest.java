@@ -204,85 +204,19 @@ public class GridToStringBuilderSelfTest extends GridCommonAbstractTest {
         fut4.get(3_000);
     }
 
-    /** */
+    /**
+     * IGNITE-28747: {@code handleRecursion} retroactively inserts an identity hash into an already
+     * written object name. When that insert pushes the head buffer past the length limit, the tail
+     * buffer must be created lazily; otherwise the following append NPEs on a {@code null} tail.
+     * The exact boundary depends on the identity hash length, so a window of payload sizes around
+     * the limit ({@code HEAD_LEN == 8000} for the default 10000 max length) is swept.
+     */
     @Test
-    public void testObjectRecursionPrevention() {
-        RecursivePayload recursivePayload1 = new RecursivePayload(8_000, null);
-        RecursivePayload recursivePayload2 = new RecursivePayload(4_000, recursivePayload1);
-        recursivePayload1.setChild(recursivePayload2);
-        String result;
-        result = recursivePayload1.toString();
-        info(result);
-        String identity = identity(recursivePayload1);
-        assertTrue(result.matches("^.*" + identity + ".*" + identity + ".*$"));
-        // it's in the middle
-        RecursivePayload recursivePayload0;
-        recursivePayload0 = new RecursivePayload(8, recursivePayload1);
-        result = recursivePayload0.toString();
-        info(result);
-        assertTrue(result.matches("^.*" + identity + ".*" + identity + ".*$"));
-        // it's in the head
-        recursivePayload0 = new RecursivePayload(8_000 - 60, recursivePayload1);
-        result = recursivePayload0.toString();
-        info(result);
-        assertTrue(result.matches("^.*" + identity + ".*" + identity + ".*$"));
-        // it's in the tail
-        recursivePayload1 = new RecursivePayload('1', 1, null);
-        identity = identity(recursivePayload1);
-        recursivePayload2 = new RecursivePayload('2', 1, recursivePayload1);
-        recursivePayload1.setChild(recursivePayload2);
-        recursivePayload0 = new RecursivePayload(8_001, recursivePayload1);
-        result = recursivePayload0.toString();
-        info(result);
-        assertTrue(result.matches("^.*" + identity + ".*" + identity + ".*$"));
-    }
+    public void testRecursionHashInsertionAtLengthLimit() {
+        for (int pad = 7_960; pad <= 8_010; pad++) {
+            String s = new SelfRef("x".repeat(pad)).toString();
 
-    /** */
-    private static class RecursivePayload {
-        /** */
-        private final String payload;
-
-        /** */
-        private RecursivePayload child;
-
-        /**
-         * Constructor
-         * @param payloadLength Payload length.
-         * @param child         Child (nullable)
-         */
-        private RecursivePayload(int payloadLength, RecursivePayload child) {
-            this('a', payloadLength, child);
-        }
-
-        /**
-         * Constructor
-         * @param payloadChar   PayloadChar
-         * @param payloadLength Payload length.
-         * @param child         Child (nullable)
-         */
-        private RecursivePayload(char payloadChar, int payloadLength, RecursivePayload child) {
-            payload = String.valueOf(payloadChar).repeat(payloadLength);
-            this.child = child;
-        }
-
-        /** */
-        public String getPayload() {
-            return payload;
-        }
-
-        /** */
-        public RecursivePayload getChild() {
-            return child;
-        }
-
-        /** */
-        public void setChild(RecursivePayload child) {
-            this.child = child;
-        }
-
-        /** {@inheritDoc} */
-        @Override public String toString() {
-            return S.toString(RecursivePayload.class, this);
+            assertTrue("toString must not break at pad=" + pad, s.contains("SelfRef"));
         }
     }
 
@@ -305,6 +239,31 @@ public class GridToStringBuilderSelfTest extends GridCommonAbstractTest {
         /** {@inheritDoc} */
         @Override public String toString() {
             return GridToStringBuilder.toString(Node.class, this);
+        }
+    }
+
+    /**
+     * Self-referential test object for IGNITE-28747: a padded payload followed by a back-reference to
+     * itself, so the recursion handler inserts the identity hash near the length limit.
+     */
+    private static class SelfRef {
+        /** */
+        @GridToStringInclude
+        private final String pad;
+
+        /** */
+        @GridToStringInclude
+        private SelfRef self;
+
+        /** @param pad Padding payload. */
+        private SelfRef(String pad) {
+            this.pad = pad;
+            this.self = this;
+        }
+
+        /** {@inheritDoc} */
+        @Override public String toString() {
+            return S.toString(SelfRef.class, this);
         }
     }
 
@@ -634,13 +593,14 @@ public class GridToStringBuilderSelfTest extends GridCommonAbstractTest {
         checkHierarchy("Wrapper [p=Child [b=0, pb=Parent[] [null], super=Parent [a=0, pa=Parent[] [null]]]]", w);
 
         p.pa[0] = p;
-        checkHierarchy("Wrapper [p=Child [b=0, pb=Parent[] [null], super=Parent" + hash +
-                " [a=0, pa=Parent[] [Child" + hash + "]]]]", w);
+
+        checkHierarchy("Wrapper [p=Child" + hash +
+            " [b=0, pb=Parent[] [null], super=Parent [a=0, pa=Parent[] [Child" + hash + "]]]]", w);
 
         ((Child)p).pb[0] = p;
 
         checkHierarchy("Wrapper [p=Child" + hash + " [b=0, pb=Parent[] [Child" + hash
-            + "], super=Parent" + hash + " [a=0, pa=Parent[] [Child" + hash + "]]]]", w);
+            + "], super=Parent [a=0, pa=Parent[] [Child" + hash + "]]]]", w);
     }
 
     /**

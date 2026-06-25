@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
-import org.apache.ignite.internal.util.tostring.GridToStringNode;
 
 /**
  * Optimized string builder with better API.
@@ -69,7 +68,6 @@ public class GridStringBuilder implements Serializable {
     /**
      *
      * @param len Length to set.
-     * @throws UnsupportedOperationException if length limit is not supported by this GridStringBuilder
      */
     public void setLength(int len) {
         impl.setLength(len);
@@ -100,7 +98,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder a(Object obj) {
-        obj = GridToStringNode.recoverObject(obj);
         impl.append(String.valueOf(obj));
 
         return this;
@@ -112,7 +109,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder a(String str) {
-        str = GridToStringNode.recoverObject(str);
         impl.append(str);
 
         return this;
@@ -135,7 +131,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder a(CharSequence s) {
-        s = GridToStringNode.recoverObject(s);
         impl.append(s);
 
         return this;
@@ -149,7 +144,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder a(CharSequence s, int start, int end) {
-        s = GridToStringNode.recoverObject(s);
         impl.append(s, start, end);
 
         return this;
@@ -261,7 +255,6 @@ public class GridStringBuilder implements Serializable {
      * @param start Start position to delete from.
      * @param end End position.
      * @return This buffer for chaining method calls.
-     * @throws UnsupportedOperationException if not supported by this imlementation
      */
     public GridStringBuilder d(int start, int end) {
         impl.delete(start, end);
@@ -273,7 +266,6 @@ public class GridStringBuilder implements Serializable {
      *
      * @param index Index to delete character at.
      * @return This buffer for chaining method calls.
-     * @throws UnsupportedOperationException if not supported by this imlementation
      */
     public GridStringBuilder d(int index) {
         impl.deleteCharAt(index);
@@ -298,10 +290,8 @@ public class GridStringBuilder implements Serializable {
      * @param end End position.
      * @param str String to replace with.
      * @return This buffer for chaining method calls.
-     * @throws UnsupportedOperationException if not supported by this imlementation
      */
     public GridStringBuilder r(int start, int end, String str) {
-        str = GridToStringNode.recoverObject(str);
         impl.replace(start, end, str);
 
         return this;
@@ -328,7 +318,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder i(int off, Object obj) {
-        obj = GridToStringNode.recoverObject(obj);
         return i(off, String.valueOf(obj));
     }
 
@@ -339,7 +328,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder i(int off, String str) {
-        str = GridToStringNode.recoverObject(str);
         impl.insert(off, str);
 
         return this;
@@ -364,7 +352,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder i(int dstOff, CharSequence s) {
-        s = GridToStringNode.recoverObject(s);
         impl.insert(dstOff, s);
 
         return this;
@@ -379,7 +366,6 @@ public class GridStringBuilder implements Serializable {
      * @return This buffer for chaining method calls.
      */
     public GridStringBuilder i(int dstOff, CharSequence s, int start, int end) {
-        s = GridToStringNode.recoverObject(s);
         impl.insert(dstOff, s, start, end);
 
         return this;
