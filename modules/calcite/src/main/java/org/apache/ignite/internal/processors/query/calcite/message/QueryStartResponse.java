@@ -24,7 +24,7 @@ import org.apache.ignite.plugin.extensions.communication.Message;
 import org.jetbrains.annotations.Nullable;
 
 /**
- *
+ * CI test for IGNITE-28822: protected class change, expected to be flagged.
  */
 public class QueryStartResponse implements Message {
     /** */
