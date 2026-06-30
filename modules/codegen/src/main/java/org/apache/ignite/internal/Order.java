@@ -23,6 +23,7 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
+ * CI test for IGNITE-28822: annotation definition file, must NOT be flagged (content has no Order import).
  * The annotation specifies the position of a field in the serialized and deserialized byte sequence of a {@code Message} class.
  * <p>
  * The {@code value} indicates the index of the field in the serialization order.
