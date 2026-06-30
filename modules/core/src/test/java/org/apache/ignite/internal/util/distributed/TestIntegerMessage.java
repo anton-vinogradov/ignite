@@ -20,7 +20,7 @@ package org.apache.ignite.internal.util.distributed;
 import org.apache.ignite.internal.Order;
 import org.apache.ignite.plugin.extensions.communication.Message;
 
-/** */
+/** Test message carrying a single integer payload. */
 public class TestIntegerMessage implements Message {
     /** */
     @Order(0)
