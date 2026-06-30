@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-// IGNITE-28822 CI fixture: protected class to be DELETED in the PR.
+// IGNITE-28822 CI fixture: protected class ADDED in the PR.
 import org.apache.ignite.internal.Order;
 
-class DeletedProtected {
+class AddedProtected {
     @Order(0)
     int a;
 }

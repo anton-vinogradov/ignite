@@ -15,13 +15,7 @@
  * limitations under the License.
  */
 
-// IGNITE-28822 CI fixture: protected class to be MODIFIED in the PR.
-import org.apache.ignite.internal.Order;
-
-class ModifiedProtected {
-    @Order(0)
+// IGNITE-28822 CI fixture: ADDED non-protected class (negative control, no @Order).
+class PlainAdded {
     int a;
-
-    @Order(1)
-    int b;
 }
