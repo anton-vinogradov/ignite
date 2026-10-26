@@ -32,6 +32,7 @@ import org.apache.ignite.configuration.ClientConnectorConfiguration;
 import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
+import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
 import org.junit.Test;
 
@@ -211,6 +212,26 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         X509Certificate[] chain = p.certificateChain();
 
         GridTestUtils.assertThrows(log, p::reload, IgniteCheckedException.class, "The new certificate chain is not valid now");
+
+        assertSame(inUse, p.context());
+        assertArrayEquals(chain, p.certificateChain());
+        assertEquals(1, p.reloadOutcome().failures());
+    }
+
+    /** A valid leaf does not make a replacement usable when its issuer has expired. */
+    @Test
+    public void testExpiredIssuerNotApplied() throws Exception {
+        long now = System.currentTimeMillis();
+        TestCertificateAuthority expiredCa = new TestCertificateAuthority("expired-ca", now - 2 * HOUR, now - HOUR);
+        KeyStore candidate = expiredCa.issue("valid-leaf", now - MINUTE, now + HOUR);
+
+        ((X509Certificate)candidate.getCertificate("valid-leaf")).checkValidity();
+
+        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR), () -> candidate));
+        SSLContext inUse = p.context();
+        X509Certificate[] chain = p.certificateChain();
+
+        GridTestUtils.assertThrows(log, p::reload, IgniteCheckedException.class, "subject=CN=expired-ca");
 
         assertSame(inUse, p.context());
         assertArrayEquals(chain, p.certificateChain());
