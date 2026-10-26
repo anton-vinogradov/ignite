@@ -37,7 +37,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
-import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
@@ -963,8 +962,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         String alias = "node";
 
         KeyStore inUse = ca.keyStoreWithPrivateKey(alias, notBefore, notAfter);
-        AtomicReference<Callable<KeyStore>> source = new AtomicReference<>(() -> inUse);
-        Issuer issuer = new Issuer(() -> source.get().call());
+        AtomicReference<Callable<KeyStore>> keySupplier = new AtomicReference<>(() -> inUse);
+        Issuer issuer = new Issuer(() -> keySupplier.get().call());
 
         SslContextProvider p = new SslContextProvider(issuer);
 
@@ -972,14 +971,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(1, p.renewalFailures());
 
         // A failed manual reload is not an automatic renewal attempt.
-        source.set(failure());
+        keySupplier.set(failure());
 
         GridTestUtils.assertThrows(log, p::reload, IgniteException.class, ISSUER_DOWN);
 
         assertEquals(1, p.renewalFailures());
 
         // Reloading the same certificate clears the reload error, but not the renewal failures.
-        source.set(() -> inUse);
+        keySupplier.set(() -> inUse);
 
         p.reload();
 
@@ -998,7 +997,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         // A different certificate with the same expiry still does not extend the chain's lifetime.
         KeyStore sameExpiry = ca.keyStoreWithPrivateKey(alias, notBefore, notAfter);
 
-        source.set(() -> sameExpiry);
+        keySupplier.set(() -> sameExpiry);
 
         p.reload();
 
@@ -1006,7 +1005,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(1, p.renewalFailures());
 
         // Only the final certificate extends the chain's lifetime.
-        source.set(() -> ca.keyStoreWithPrivateKey(notBefore, notAfter + HOUR));
+        keySupplier.set(() -> ca.keyStoreWithPrivateKey(notBefore, notAfter + HOUR));
 
         p.reload();
 
@@ -1475,11 +1474,6 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         /** {@inheritDoc} */
         @Override protected void checkParameters() {
             // No-op.
-        }
-
-        /** {@inheritDoc} */
-        @Override protected KeyManager[] createKeyManagers() throws SSLException {
-            return createKeyMaterial().keyManagers();
         }
 
         /** {@inheritDoc} */
