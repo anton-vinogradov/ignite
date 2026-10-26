@@ -288,7 +288,8 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         /**
          * Takes the chain from the store used to create the key managers. A store with one private key and an X.509 chain
          * supplies that chain. More than one private key, or a chain containing a non-X.509 certificate, leaves the chain
-         * unknown. A store without a private key records that fact separately from an unknown chain.
+         * unknown. A store without a private key records that fact separately from an unknown chain. The node refuses such
+         * material during reload.
          *
          * @param keyMgrs Key managers initialized from the store.
          * @param store Already loaded key store.
