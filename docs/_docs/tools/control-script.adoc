@@ -1784,7 +1784,8 @@ Each result line lists the transports that share an SSL context factory and are 
 If that update fails, those transports keep their previous context. Successful updates stay in use, even on a node where another factory failed.
 
 The command lists failed nodes first and exits with an error if any update failed.
-Correct the reported cause and run reload again. Every node also records its result in the log, including the user's login and network address when security is enabled.
+Correct the reported cause and run reload again.
+Each factory reload attempt is also recorded in the node log, including the user's login and network address when security is enabled.
 
 A successful result means the new SSL context is in use for new connections. Use `--ssl status` to check the loaded certificate, then test new connections as described in link:security/ssl-tls#upgrading-certificates[Upgrading Certificates].
 
