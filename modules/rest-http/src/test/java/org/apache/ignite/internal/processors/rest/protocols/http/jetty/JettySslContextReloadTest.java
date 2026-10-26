@@ -23,6 +23,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyStore;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Collection;
@@ -36,6 +37,7 @@ import org.apache.ignite.internal.processors.rest.GridRestProtocol;
 import org.apache.ignite.internal.util.typedef.internal.U;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
+import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
@@ -43,17 +45,19 @@ import org.eclipse.jetty.server.SslConnectionFactory;
 import org.junit.Test;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.util.concurrent.TimeUnit.DAYS;
+import static java.util.concurrent.TimeUnit.HOURS;
 import static org.apache.ignite.internal.IgniteNodeAttributes.ATTR_REST_JETTY_PORT;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.HTTP_REST;
 import static org.apache.ignite.ssl.SslTestUtils.assertClientAuthentication;
 import static org.apache.ignite.ssl.SslTestUtils.clientContext;
-import static org.apache.ignite.ssl.SslTestUtils.place;
 import static org.apache.ignite.ssl.SslTestUtils.reload;
 import static org.apache.ignite.ssl.SslTestUtils.reloadFailure;
-import static org.apache.ignite.ssl.SslTestUtils.servedSubject;
+import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
-import static org.apache.ignite.testframework.GridTestUtils.keyStorePassword;
+import static org.apache.ignite.testframework.TestCertificateAuthority.PWD;
+import static org.apache.ignite.testframework.TestCertificateAuthority.save;
 import static org.junit.Assert.assertArrayEquals;
 
 /** Tests HTTP REST certificate reload through {@link ConnectorConfiguration#setHttpSslFactory}. */
@@ -76,6 +80,27 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     /** Trust store HTTP REST runs on; replaced on disk to rotate the trusted authority. */
     private Path trustStore;
 
+    /** Server key and certificate signed by the old authority. */
+    private KeyStore oldServerKeys;
+
+    /** Replacement server key and certificate signed by the new authority. */
+    private KeyStore newServerKeys;
+
+    /** Client key and certificate signed by the old authority. */
+    private KeyStore oldClientKeys;
+
+    /** Client key and certificate signed by the new authority. */
+    private KeyStore newClientKeys;
+
+    /** Trusts only the old authority. */
+    private KeyStore oldTrust;
+
+    /** Trusts only the new authority. */
+    private KeyStore newTrust;
+
+    /** Lets probes trust the server before and after rotation. */
+    private KeyStore bothTrust;
+
     /** Jetty configuration, {@code null} for the built-in one. */
     private String jettyPath;
 
@@ -95,10 +120,12 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
         SslContextFactory factory = new SslContextFactory();
 
+        factory.setKeyStoreType("JKS");
         factory.setKeyStoreFilePath(keyStore.toString());
-        factory.setKeyStorePassword(keyStorePassword().toCharArray());
+        factory.setKeyStorePassword(PWD);
+        factory.setTrustStoreType("JKS");
         factory.setTrustStoreFilePath(trustStore.toString());
-        factory.setTrustStorePassword(keyStorePassword().toCharArray());
+        factory.setTrustStorePassword(PWD);
 
         if (protocols != null)
             factory.setProtocols(protocols);
@@ -113,11 +140,23 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
 
     /** {@inheritDoc} */
     @Override protected void beforeTest() throws Exception {
+        TestCertificateAuthority oldCa = new TestCertificateAuthority("old-http-ca");
+        TestCertificateAuthority newCa = new TestCertificateAuthority("new-http-ca");
+        long now = System.currentTimeMillis();
+
+        oldServerKeys = oldCa.issue("node01", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
+        newServerKeys = newCa.issue("node02", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
+        oldClientKeys = oldCa.issue("client01", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
+        newClientKeys = newCa.issue("client02", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
+        oldTrust = oldCa.trustStore();
+        newTrust = newCa.trustStore();
+        bothTrust = TestCertificateAuthority.trustStore(oldCa, newCa);
+
         keyStore = Files.createTempFile("ignite-jetty-ssl-reload-", ".jks");
         trustStore = Files.createTempFile("ignite-jetty-ssl-trust-", ".jks");
 
-        place("node01", keyStore);
-        place("trustboth", trustStore);
+        save(oldServerKeys, keyStore);
+        save(bothTrust, trustStore);
     }
 
     /** {@inheritDoc} */
@@ -145,7 +184,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         try (SSLSocket open = socket(client, port(g))) {
             assertEquals("CN=node01", serverSubject(open));
 
-            place("node02", keyStore);
+            save(newServerKeys, keyStore);
 
             assertContains(log, reload(g), ": reloaded " + HTTP_REST);
             assertVersionResponse(open, "node01");
@@ -161,7 +200,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
             assertVersionResponse(byIp, "127.0.0.1");
         }
 
-        try (SSLSocket anonymous = socket(clientContext(null), port(g))) {
+        try (SSLSocket anonymous = socket(clientContext(null, bothTrust), port(g))) {
             assertVersionResponse(anonymous, "node02");
         }
 
@@ -170,7 +209,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         Files.write(keyStore, "not a key store".getBytes());
 
         assertContains(log, reloadFailure(g), "failed on " + HTTP_REST);
-        assertEquals("CN=node02", servedSubject(port(g)));
+        assertEquals(newServerKeys.getCertificate("node02"), servedCertificate(trustedClient(), port(g)));
     }
 
     /** Factory TLS settings survive reload while Jetty's cipher exclusions still apply. */
@@ -183,7 +222,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
             .findFirst().orElseThrow(() -> new AssertionError("The JVM must support a cipher suite excluded by Jetty"));
 
         protocols = new String[] {"TLSv1.2"};
-        cipherSuites = new String[] {"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", excluded};
+        cipherSuites = new String[] {"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", excluded};
 
         IgniteEx g = startGrid(0);
 
@@ -199,7 +238,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
             assertEquals(cipherSuites[0], sock.getSession().getCipherSuite());
         }
 
-        place("node02", keyStore);
+        save(newServerKeys, keyStore);
 
         assertContains(log, reload(g), ": reloaded " + HTTP_REST);
 
@@ -251,7 +290,8 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
 
         IgniteEx g = startGrid(0);
 
-        try (SSLSocket sock = socket(trustedClient(), port(g))) {
+        // Keep the original XML and its checked-in stores as the legacy configuration compatibility check.
+        try (SSLSocket sock = socket(GridTestUtils.sslTrustedFactory("node01", "trustboth").create(), port(g))) {
             assertEquals("CN=node01", serverSubject(sock));
             assertVersionResponse(sock, "node01");
         }
@@ -283,25 +323,25 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     public void testClientAuth() throws Exception {
         clientAuth = true;
 
-        place("trustone", trustStore);
+        save(oldTrust, trustStore);
 
         IgniteEx g = startGrid(0);
         int port = port(g);
 
-        assertClientAuthentication(port, "node01", "node02");
+        assertClientAuthentication(port, oldClientKeys, newClientKeys, bothTrust);
 
-        try (SSLSocket sock = socket(clientContext("node01"), port)) {
+        try (SSLSocket sock = socket(clientContext(oldClientKeys, bothTrust), port)) {
             assertVersionResponse(sock, "node01");
         }
 
-        place("node02", keyStore);
-        place("trusttwo", trustStore);
+        save(newServerKeys, keyStore);
+        save(newTrust, trustStore);
 
         assertContains(log, reload(g), ": reloaded " + HTTP_REST);
 
-        assertClientAuthentication(port, "node02", "node01");
+        assertClientAuthentication(port, newClientKeys, oldClientKeys, bothTrust);
 
-        try (SSLSocket sock = socket(clientContext("node02"), port)) {
+        try (SSLSocket sock = socket(clientContext(newClientKeys, bothTrust), port)) {
             assertEquals("CN=node02", serverSubject(sock));
             assertVersionResponse(sock, "node02");
         }
@@ -317,9 +357,9 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         return ((ServerConnector)srv.getConnectors()[0]).getConnectionFactory(SslConnectionFactory.class).getSslContextFactory();
     }
 
-    /** @return A new client context with the trusted node certificate. */
-    private static SSLContext trustedClient() {
-        return GridTestUtils.sslTrustedFactory("node01", "trustboth").create();
+    /** @return A fresh client context that trusts both server authorities. */
+    private SSLContext trustedClient() throws Exception {
+        return clientContext(oldClientKeys, bothTrust);
     }
 
     /** @return HTTP REST port of the node. */
