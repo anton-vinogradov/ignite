@@ -204,10 +204,11 @@ public class SslContextProvider {
         }
         catch (Throwable e) {
             if (!Thread.currentThread().isInterrupted() &&
-                !X.hasCause(e, InterruptedException.class, IgniteInterruptedException.class, IgniteInterruptedCheckedException.class))
+                !X.hasCause(e, InterruptedException.class, IgniteInterruptedException.class, IgniteInterruptedCheckedException.class)) {
                 renewalFailures++;
 
-            onFailure(e);
+                onFailure(e);
+            }
 
             throw e;
         }

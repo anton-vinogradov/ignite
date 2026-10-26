@@ -716,7 +716,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(2, logged(Level.ERROR, WAITING));
     }
 
-    /** A node that stops in the middle of a renewal attempt must interrupt it and log no failure. */
+    /** A node that stops in the middle of a renewal attempt must interrupt it without recording or logging a failure. */
     @Test
     public void testStopDuringRenewalLogsNoFailure() throws Exception {
         long now = System.currentTimeMillis();
@@ -740,6 +740,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         stopGrid(0);
 
         assertEquals(0, p.renewalFailures());
+        assertEquals(0, p.reloadOutcome().failures());
         assertTrue(appender.events().stream().noneMatch(e -> e.getLevel().isMoreSpecificThan(Level.WARN)));
     }
 
