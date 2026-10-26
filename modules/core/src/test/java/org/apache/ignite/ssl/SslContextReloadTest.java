@@ -381,10 +381,10 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
     @Test
     public void testExpiredCertificateNotApplied() throws Exception {
         KeyStore expiredStore = expiredKeys();
-        String expiredSubject = certificateChain(expiredStore)[0].getSubjectX500Principal().getName();
+        String expiredSubj = certificateChain(expiredStore)[0].getSubjectX500Principal().getName();
 
         LogListener expired = LogListener.matches(Pattern.compile("Failed to reload TLS certificates, the ones in use stay .*" +
-            "reason=The new certificate chain is not valid now \\[subject=" + Pattern.quote(expiredSubject) + ',')).build();
+            "reason=The new certificate chain is not valid now \\[subject=" + Pattern.quote(expiredSubj) + ',')).build();
 
         nodeLog.registerListener(expired);
 
@@ -395,7 +395,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         String res = reloadFailure(g);
 
         assertFailed(res, g, ALL_TRANSPORTS);
-        assertContains(log, res, "The new certificate chain is not valid now [subject=" + expiredSubject + ',');
+        assertContains(log, res, "The new certificate chain is not valid now [subject=" + expiredSubj + ',');
         assertTrue(expired.check());
         assertEquals(oldCert, certificateAt(discoveryPort(g)));
 
@@ -575,7 +575,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
         KeyStore expiredStore = expiredKeys();
         X509Certificate expired = certificateChain(expiredStore)[0];
-        String expiredSubject = expired.getSubjectX500Principal().getName();
+        String expiredSubj = expired.getSubjectX500Principal().getName();
 
         TestCertificateAuthority.save(expiredStore, keyStore(getTestIgniteInstanceName(0)));
 
@@ -584,8 +584,8 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         String res = X.getFullStackTrace(GridTestUtils.assertThrows(log, () -> status(g), Exception.class, null));
         String id = node(g);
 
-        assertContains(log, res, id + ": " + CLIENT_CONNECTOR + "\n    loaded subject=" + expiredSubject + ", issuer=");
-        assertContains(log, res, id + ": " + COMMUNICATION + ", " + DISCOVERY + "\n    loaded subject=" + expiredSubject + ", issuer=");
+        assertContains(log, res, id + ": " + CLIENT_CONNECTOR + "\n    loaded subject=" + expiredSubj + ", issuer=");
+        assertContains(log, res, id + ": " + COMMUNICATION + ", " + DISCOVERY + "\n    loaded subject=" + expiredSubj + ", issuer=");
         assertContains(log, res, expired.getIssuerX500Principal().getName());
         assertContains(log, res, "PROBLEM: the loaded certificate is not valid now");
     }
@@ -631,7 +631,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
         placeKeys(newKeys);
 
-        String expectedSubject = newCert.getSubjectX500Principal().getName();
+        String expectedSubj = newCert.getSubjectX500Principal().getName();
         VisorTaskArgument<NoArg> arg = new VisorTaskArgument<>(List.of(g.localNode().id(), unavailable), new NoArg(), false);
 
         for (Class<? extends AbstractSslTask> task : List.of(SslReloadTask.class, SslStatusTask.class)) {
@@ -640,7 +640,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
             assertContains(log, err.getMessage(), "Failed on 1 node(s):\n" + unavailable +
                 ": node was unavailable to run the command");
             assertContains(log, err.getMessage(), "Succeeded on 1 node(s):\n" + node(g) + ':');
-            assertContains(log, err.getMessage(), "loaded subject=" + expectedSubject + ',');
+            assertContains(log, err.getMessage(), "loaded subject=" + expectedSubj + ',');
         }
 
         assertEquals(newCert, certificateAt(g.context().clientListener().port()));
