@@ -44,6 +44,7 @@ import static java.util.concurrent.TimeUnit.MINUTES;
 import static org.apache.ignite.internal.IgniteNodeAttributes.ATTR_REST_JETTY_PORT;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.HTTP_REST;
 import static org.apache.ignite.testframework.GridTestUtils.waitForCondition;
+import static org.apache.ignite.testframework.TestCertificateAuthority.certificateChain;
 
 /** Tests automatic certificate renewal for HTTPS through the managed HTTP REST factory. */
 public class JettySslContextRenewalTest extends GridCommonAbstractTest {
@@ -66,9 +67,13 @@ public class JettySslContextRenewalTest extends GridCommonAbstractTest {
     public void testAutomaticRenewal() throws Exception {
         TestCertificateAuthority ca = new TestCertificateAuthority("http-renewal-ca");
         long now = System.currentTimeMillis();
-        KeyStore initKeys = ca.issue("localhost", now - HOURS.toMillis(1), now + MINUTES.toMillis(5));
-        KeyStore renewed = ca.issue("localhost", now - MINUTES.toMillis(1), now + HOURS.toMillis(1));
-        X509Certificate replacement = (X509Certificate)renewed.getCertificate("localhost");
+        long lifetime = HOURS.toMillis(1);
+        long timeLeft = MINUTES.toMillis(5);
+        long renewalWindow = 2 * timeLeft;
+        long initExpiry = now + timeLeft;
+        KeyStore initKeys = ca.issue(initExpiry - lifetime, initExpiry);
+        KeyStore renewed = ca.issue(now, now + lifetime);
+        X509Certificate replacement = certificateChain(renewed)[0];
         KeyStore trust = ca.trustStore();
         CountDownLatch replacementReady = new CountDownLatch(1);
         AtomicBoolean first = new AtomicBoolean(true);
@@ -94,6 +99,7 @@ public class JettySslContextRenewalTest extends GridCommonAbstractTest {
         };
 
         factory.setRenewalEnabled(true);
+        factory.setRenewBeforeFraction((double)renewalWindow / lifetime);
 
         try {
             IgniteEx g = startGrid(0);
@@ -103,7 +109,7 @@ public class JettySslContextRenewalTest extends GridCommonAbstractTest {
 
             X509Certificate[] before = probe(port, trust);
 
-            assertEquals(initKeys.getCertificate("localhost"), before[0]);
+            assertEquals(certificateChain(initKeys)[0], before[0]);
 
             replacementReady.countDown();
 
@@ -129,13 +135,14 @@ public class JettySslContextRenewalTest extends GridCommonAbstractTest {
      * @return Certificate chain served over HTTPS.
      */
     private X509Certificate[] probe(int port, KeyStore trust) throws Exception {
+        int timeout = 30_000;
         SSLContext client = SSLContext.getInstance("TLS");
 
         client.init(null, TestCertificateAuthority.trustManagers(trust), null);
 
         try (SSLSocket sock = (SSLSocket)client.getSocketFactory().createSocket()) {
-            sock.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 30_000);
-            sock.setSoTimeout(30_000);
+            sock.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), timeout);
+            sock.setSoTimeout(timeout);
             sock.startHandshake();
 
             Certificate[] chain = sock.getSession().getPeerCertificates();
