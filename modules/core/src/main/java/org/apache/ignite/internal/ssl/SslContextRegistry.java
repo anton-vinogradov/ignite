@@ -46,6 +46,9 @@ public class SslContextRegistry extends GridProcessorAdapter {
     public static final String BINARY_REST = "binary REST";
 
     /** */
+    public static final String HTTP_REST = "HTTP REST";
+
+    /** */
     private final Collection<SslContextProvider> providers = new CopyOnWriteArrayList<>();
 
     /**
