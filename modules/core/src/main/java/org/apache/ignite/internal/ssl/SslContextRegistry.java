@@ -21,13 +21,17 @@ import java.security.cert.X509Certificate;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.SSLContext;
 import org.apache.ignite.internal.GridKernalContext;
 import org.apache.ignite.internal.processors.GridProcessorAdapter;
 import org.apache.ignite.internal.util.typedef.internal.U;
 
-/** SSL contexts of a node: one provider per configured factory, shared by its transports. */
+import static org.apache.ignite.internal.thread.pool.IgniteScheduledThreadPoolExecutor.newSingleThreadScheduledExecutor;
+
+/** SSL contexts of a node: one provider per configured factory, with automatic renewals and their node-wide failure metric. */
 public class SslContextRegistry extends GridProcessorAdapter {
     /** */
     public static final String COMMUNICATION = "communication";
@@ -44,9 +48,24 @@ public class SslContextRegistry extends GridProcessorAdapter {
     /** */
     private final Collection<SslContextProvider> providers = new CopyOnWriteArrayList<>();
 
+    /**
+     * Single-threaded executor for all renewals on this node, so a slow factory does not block a shared pool thread.
+     * Its thread starts with the first renewal.
+     */
+    private final ScheduledExecutorService renewalExec;
+
     /** @param ctx Kernal context. */
     public SslContextRegistry(GridKernalContext ctx) {
         super(ctx);
+
+        renewalExec = newSingleThreadScheduledExecutor("ssl-renewal", ctx.igniteInstanceName());
+    }
+
+    /** {@inheritDoc} */
+    @Override public void onKernalStart(boolean active) {
+        ctx.metric().registry("ssl").register("ConsecutiveRenewalFailures",
+            () -> providers.stream().mapToInt(SslContextProvider::renewalFailures).sum(),
+            "Sum of unsuccessful automatic renewals across factories; each factory resets its count after a later-expiring chain.");
     }
 
     /**
@@ -61,6 +80,7 @@ public class SslContextRegistry extends GridProcessorAdapter {
         if (provider == null) {
             provider = new SslContextProvider(factory);
             provider.addTransport(transport);
+            provider.startRenewal(renewalExec, ctx.log(SslRenewal.class));
             warnIfExpired(provider);
 
             providers.add(provider);
@@ -86,5 +106,17 @@ public class SslContextRegistry extends GridProcessorAdapter {
     /** @return One provider per factory object, in registration order; sharing a factory never adds another provider. */
     public Collection<SslContextProvider> providers() {
         return Collections.unmodifiableCollection(providers);
+    }
+
+    /** Interrupts a renewal attempt in progress and waits for it to end. */
+    @Override public void onKernalStop(boolean cancel) {
+        renewalExec.shutdownNow();
+
+        try {
+            renewalExec.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

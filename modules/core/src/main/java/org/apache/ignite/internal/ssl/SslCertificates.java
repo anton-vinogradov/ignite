@@ -21,7 +21,7 @@ import java.security.cert.X509Certificate;
 import org.apache.ignite.internal.util.typedef.X;
 import org.jetbrains.annotations.Nullable;
 
-/** Certificate dates and descriptions used by SSL reload and status. */
+/** Certificate dates and descriptions used by SSL reload, renewal and status. */
 public class SslCertificates {
     /** */
     private SslCertificates() {

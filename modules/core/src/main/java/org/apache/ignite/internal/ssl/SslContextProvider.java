@@ -19,18 +19,26 @@ package org.apache.ignite.internal.ssl;
 
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.ScheduledExecutorService;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.SSLContext;
 import org.apache.ignite.IgniteCheckedException;
+import org.apache.ignite.IgniteException;
+import org.apache.ignite.IgniteInterruptedException;
+import org.apache.ignite.IgniteLogger;
+import org.apache.ignite.internal.IgniteInterruptedCheckedException;
+import org.apache.ignite.internal.util.typedef.X;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
 import org.apache.ignite.ssl.SSLContextWrapper;
 import org.jetbrains.annotations.Nullable;
 
+import static org.apache.ignite.internal.ssl.SslCertificates.chainNotAfter;
 import static org.apache.ignite.internal.ssl.SslCertificates.describe;
 
-/** Owns one factory's context and reloads on this node; transports using that factory share its context. */
+/** Owns one factory's context, reloads and automatic renewal on this node; transports using that factory share its context. */
 public class SslContextProvider {
     /** */
     private final Factory<SSLContext> factory;
@@ -44,8 +52,17 @@ public class SslContextProvider {
     /** Stable context handed to every transport using this factory. */
     private final SSLContext sharedCtx;
 
+    /** Renewal window configured at registration, or {@code 0} when automatic renewal is disabled. */
+    private final double renewBeforeFraction;
+
+    /** Automatic renewal, attached before this provider is registered. */
+    private @Nullable SslRenewal renewal;
+
     /** Snapshot of the last successful reload and subsequent failures. */
     private volatile ReloadOutcome outcome = new ReloadOutcome(0, 0, null, 0);
+
+    /** Failed automatic attempts since a chain with a later expiry was put in use. */
+    private volatile int renewalFailures;
 
     /** @param factory Factory to build the context with. */
     SslContextProvider(Factory<SSLContext> factory) {
@@ -53,6 +70,8 @@ public class SslContextProvider {
 
         ctx = factory.create();
         ctx.createSSLEngine();
+
+        renewBeforeFraction = factory instanceof AbstractSslContextFactory f && f.isRenewalEnabled() ? f.getRenewBeforeFraction() : 0;
 
         sharedCtx = new CurrentSslContext(this::context);
     }
@@ -95,8 +114,26 @@ public class SslContextProvider {
     }
 
     /**
+     * @param exec Renewal thread of the node.
+     * @param log Renewal logger.
+     */
+    void startRenewal(ScheduledExecutorService exec, IgniteLogger log) {
+        if (renewBeforeFraction == 0)
+            return;
+
+        if (certificateChain() == null) {
+            throw new IgniteException("The SSL context factory provides no certificate chain, so it cannot be renewed automatically " +
+                "[transports=" + transports() + ']');
+        }
+
+        renewal = new SslRenewal(this, renewBeforeFraction, exec, log);
+        renewal.replan();
+    }
+
+    /**
      * Builds and installs a new context for new connections, recording success or failure. Rejects key material known to have no
      * private key. If a certificate chain is supplied, every certificate must be within its validity period.
+     * Certificate metadata is required when automatic renewal is enabled.
      * The administrator must ensure that peers trust the new certificates and can connect with the new context.
      *
      * @return Certificate installed by this reload, or {@code null} if its metadata is unavailable.
@@ -113,9 +150,9 @@ public class SslContextProvider {
 
             X509Certificate[] next = certificateChain(rebuilt);
 
-            check(next);
+            check(next, renewBeforeFraction > 0);
 
-            ctx = rebuilt;
+            putInUse(rebuilt, next);
         }
         catch (Throwable e) {
             onFailure(e);
@@ -126,6 +163,71 @@ public class SslContextProvider {
         onSuccess();
 
         return certificate();
+    }
+
+    /**
+     * Installs a new context only if its chain expires later than the current chain. Otherwise, renewal would immediately be due again.
+     * Returning the current chain counts as an unsuccessful attempt and leaves the context unchanged.
+     *
+     * @param expected Context the renewal was planned for.
+     * @return Certificate installed by this attempt, or {@code null} if the factory returned the chain in use or the planned
+     *      context had already been replaced.
+     * @throws IgniteCheckedException If the new context supplies no chain, or another chain that fails the checks of {@link #reload()}
+     *      or does not expire later.
+     */
+    synchronized @Nullable X509Certificate renew(SSLContext expected) throws IgniteCheckedException {
+        if (ctx != expected)
+            return null;
+
+        try {
+            SSLContext rebuilt = build();
+
+            X509Certificate[] next = certificateChain(rebuilt);
+            X509Certificate[] chain = certificateChain(ctx);
+
+            if (next != null && Arrays.equals(next, chain)) {
+                renewalFailures++;
+
+                return null;
+            }
+
+            check(next, true);
+
+            if (chain != null && chainNotAfter(next) <= chainNotAfter(chain)) {
+                throw new IgniteCheckedException("The new certificate chain expires no later than the one in use; if a certificate " +
+                    "authority in the chain expires first, renew it [" + describe(next[0]) +
+                    ", chainNotAfter=" + Instant.ofEpochMilli(chainNotAfter(next)) +
+                    ", inUseChainNotAfter=" + Instant.ofEpochMilli(chainNotAfter(chain)) + ']');
+            }
+
+            putInUse(rebuilt, next);
+        }
+        catch (Throwable e) {
+            if (!Thread.currentThread().isInterrupted() &&
+                !X.hasCause(e, InterruptedException.class, IgniteInterruptedException.class, IgniteInterruptedCheckedException.class))
+                renewalFailures++;
+
+            onFailure(e);
+
+            throw e;
+        }
+
+        onSuccess();
+
+        return certificate();
+    }
+
+    /**
+     * @param rebuilt Context that passed the checks.
+     * @param next Chain loaded with it, {@code null} if it is unknown.
+     */
+    private void putInUse(SSLContext rebuilt, @Nullable X509Certificate[] next) {
+        X509Certificate[] chain = certificateChain(ctx);
+
+        if (next != null && (chain == null || chainNotAfter(next) > chainNotAfter(chain)))
+            renewalFailures = 0;
+
+        ctx = rebuilt;
     }
 
     /**
@@ -153,9 +255,13 @@ public class SslContextProvider {
 
     /**
      * @param next Chain loaded with the new context, {@code null} if it is unknown.
-     * @throws IgniteCheckedException If a certificate is outside its validity period.
+     * @param requireChain Whether automatic renewal requires a known chain.
+     * @throws IgniteCheckedException If the chain is required but missing, or a certificate is outside its validity period.
      */
-    private void check(@Nullable X509Certificate[] next) throws IgniteCheckedException {
+    private void check(@Nullable X509Certificate[] next, boolean requireChain) throws IgniteCheckedException {
+        if (next == null && requireChain)
+            throw new IgniteCheckedException("The new SSL context provides no certificate chain, so it cannot be renewed automatically");
+
         long now = System.currentTimeMillis();
 
         X509Certificate invalid = next == null ? null : SslCertificates.invalidAt(next, now);
@@ -169,6 +275,9 @@ public class SslContextProvider {
     /** Records a successful reload. */
     private void onSuccess() {
         outcome = new ReloadOutcome(System.currentTimeMillis(), 0, null, 0);
+
+        if (renewal != null)
+            renewal.replan();
     }
 
     /** @param e Why the reload failed. */
@@ -183,6 +292,11 @@ public class SslContextProvider {
         return outcome;
     }
 
+    /** @return Failed automatic attempts since a chain with a later expiry was put in use, including unchanged certificates. */
+    int renewalFailures() {
+        return renewalFailures;
+    }
+
     /**
      * Snapshot of the last successful reload and subsequent failures.
      *
@@ -193,5 +307,10 @@ public class SslContextProvider {
      */
     public record ReloadOutcome(long successTime, long failureTime, @Nullable String failureReason, int failures) {
         // No-op.
+    }
+
+    /** @return Time of the next automatic renewal, {@code 0} if none is planned. */
+    public long nextRenewalTime() {
+        return renewal == null ? 0 : renewal.nextRenewalTime();
     }
 }

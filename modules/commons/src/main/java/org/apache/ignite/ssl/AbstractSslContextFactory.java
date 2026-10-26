@@ -46,6 +46,9 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     /** Default SSL protocol. */
     public static final String DFLT_SSL_PROTOCOL = "TLS";
 
+    /** Default share of the certificate lifetime left when a node starts to renew it. */
+    public static final double DFLT_RENEW_BEFORE_FRACTION = 0.15;
+
     /** SSL protocol. */
     protected String proto = DFLT_SSL_PROTOCOL;
 
@@ -57,6 +60,12 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
 
     /** Cached instance of an {@link SSLContext}. */
     protected final AtomicReference<SSLContext> sslCtx = new AtomicReference<>();
+
+    /** Whether a node builds its SSL context again before the certificate expires, to pick up a new certificate. */
+    private boolean renewalEnabled;
+
+    /** Share of the certificate lifetime left when a node starts to renew it. */
+    private double renewBeforeFraction = DFLT_RENEW_BEFORE_FRACTION;
 
     /**
      * Gets protocol for secure transport.
@@ -112,6 +121,43 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      */
     public void setProtocols(String... protocols) {
         this.protocols = protocols;
+    }
+
+    /** @return Whether a node builds its SSL context again before the certificate expires, to pick up a new certificate. */
+    public boolean isRenewalEnabled() {
+        return renewalEnabled;
+    }
+
+    /**
+     * Sets whether a node calls {@link #createNew()} before the certificate expires to pick up a new certificate.
+     * A file-based factory rereads its files. It does not replace them.
+     * When enabled, the factory must provide certificate chain metadata or the node does not start. Disabled by default.
+     * Set this before starting the node; changing it on a running node takes effect after a restart.
+     *
+     * @param renewalEnabled Whether renewal is enabled.
+     */
+    public void setRenewalEnabled(boolean renewalEnabled) {
+        this.renewalEnabled = renewalEnabled;
+    }
+
+    /** @return Share of the certificate lifetime left when a node starts to renew the certificate. */
+    public double getRenewBeforeFraction() {
+        return renewBeforeFraction;
+    }
+
+    /**
+     * Sets the share of the certificate lifetime left when a node starts to renew the certificate. The lifetime runs from the time
+     * the certificate becomes valid to the earliest expiry in its chain. The value must be greater than {@code 0} and less than
+     * {@code 1}, otherwise this method throws {@link IllegalArgumentException}.
+     * If not specified, {@link #DFLT_RENEW_BEFORE_FRACTION} is used.
+     * Set this before starting the node; changing it on a running node takes effect after a restart.
+     *
+     * @param renewBeforeFraction Share of the lifetime.
+     */
+    public void setRenewBeforeFraction(double renewBeforeFraction) {
+        A.ensure(renewBeforeFraction > 0 && renewBeforeFraction < 1, "renewBeforeFraction must be greater than 0 and less than 1");
+
+        this.renewBeforeFraction = renewBeforeFraction;
     }
 
     /**
@@ -229,9 +275,12 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * through another mechanism, attach its loaded certificate chain, if known, using
      * {@link SSLContextWrapper#SSLContextWrapper(SSLContext, SSLParameters, X509Certificate[])}.
      * <p>
-     * The node calls this method for {@code control.sh --ssl reload}. Calls for the same factory on a node never overlap;
-     * calls for different factories may run at the same time. A subclass that fetches certificates from a remote source must
-     * limit how long a call takes and stop when its thread is interrupted.
+     * The node calls this method for {@code control.sh --ssl reload} and automatic certificate renewal. Calls for the same
+     * factory on a node never overlap; calls for different factories may run at the same time. Automatic renewal requires
+     * certificate chain metadata both at startup and on every reload.
+     * <p>
+     * A subclass that fetches certificates from a remote source must limit how long a call takes and stop when its thread is
+     * interrupted. When the node stops, it interrupts an automatic renewal in progress and waits for it to end.
      *
      * @return New initialized SSL context.
      * @throws IgniteException If the context could not be created.
