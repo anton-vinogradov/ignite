@@ -23,7 +23,6 @@ import java.security.cert.X509Certificate;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicReference;
-import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
@@ -157,6 +156,49 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         assertNull(p.certificateChain());
         assertTrue(p.reloadOutcome().successTime() > 0);
         assertEquals(0, p.reloadOutcome().failures());
+    }
+
+    /** Reload failures keep the active context and last success time. A successful retry clears the failure history. */
+    @Test
+    public void testReloadFailureRetainsContextUntilRecovery() throws Exception {
+        Callable<KeyStore> unavailable = () -> {
+            throw new IgniteException("Certificate source is unavailable");
+        };
+
+        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR), fresh(HOUR), unavailable, unavailable, fresh(2 * HOUR)));
+
+        p.reload();
+
+        SSLContext inUse = p.context();
+        X509Certificate[] chain = p.certificateChain();
+        long lastSuccess = p.reloadOutcome().successTime();
+
+        assertTrue(lastSuccess > 0);
+
+        for (int failures = 1; failures <= 2; failures++) {
+            long attemptStart = System.currentTimeMillis();
+
+            GridTestUtils.assertThrows(log, p::reload, IgniteException.class, "Certificate source is unavailable");
+
+            assertSame(inUse, p.context());
+            assertArrayEquals(chain, p.certificateChain());
+            assertEquals(lastSuccess, p.reloadOutcome().successTime());
+            assertEquals(failures, p.reloadOutcome().failures());
+            assertTrue(p.reloadOutcome().failureTime() >= attemptStart);
+            assertContains(log, p.reloadOutcome().failureReason(), "Certificate source is unavailable");
+        }
+
+        long recoveryStart = System.currentTimeMillis();
+
+        X509Certificate recovered = p.reload();
+
+        assertNotSame(inUse, p.context());
+        assertEquals(recovered, p.certificate());
+        assertTrue(recovered.getNotAfter().after(chain[0].getNotAfter()));
+        assertTrue(p.reloadOutcome().successTime() >= recoveryStart);
+        assertEquals(0, p.reloadOutcome().failures());
+        assertEquals(0, p.reloadOutcome().failureTime());
+        assertNull(p.reloadOutcome().failureReason());
     }
 
     /** A not yet valid candidate leaves the working context and its metadata in use. */
@@ -355,11 +397,6 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         /** {@inheritDoc} */
         @Override protected void checkParameters() {
             // No-op.
-        }
-
-        /** {@inheritDoc} */
-        @Override protected KeyManager[] createKeyManagers() throws SSLException {
-            return createKeyMaterial().keyManagers();
         }
 
         /** {@inheritDoc} */
