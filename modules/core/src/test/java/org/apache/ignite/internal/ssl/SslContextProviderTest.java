@@ -71,7 +71,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     /** Changing a returned chain must not change the provider's certificate or chain. */
     @Test
     public void testCertificateChainCannotChangeProvider() {
-        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR)));
+        SslContextProvider p = new SslContextProvider(new Issuer(ca::issue));
 
         X509Certificate[] chain = p.certificateChain();
 
@@ -100,12 +100,11 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     /** Reload installs the administrator's material; an actual TLS connection still rejects an authority the peer does not trust. */
     @Test
     public void testReloadDoesNotBypassPeerTrust() throws Exception {
-        long now = System.currentTimeMillis();
-
+        String untrustedCaName = "untrusted-ca";
         TestCertificateAuthority peerCa = new TestCertificateAuthority("peerca");
-        TestCertificateAuthority untrusted = new TestCertificateAuthority("untrustedca");
-        AtomicReference<KeyStore> keys = new AtomicReference<>(ca.issue("node0", now - MINUTE, now + HOUR));
-        KeyStore peerKeys = peerCa.issue("node1", now - MINUTE, now + HOUR);
+        TestCertificateAuthority untrusted = new TestCertificateAuthority(untrustedCaName);
+        AtomicReference<KeyStore> keys = new AtomicReference<>(ca.issue());
+        KeyStore peerKeys = peerCa.issue();
 
         Issuer issuer = issuer(keys::get, peerCa.trustStore());
         Issuer peerIssuer = issuer(() -> peerKeys, ca.trustStore());
@@ -117,19 +116,19 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
         assertEquals(provider(g0).certificate(), servedCertificate(peerIssuer.createNew(), discoveryPort(g0)));
 
-        keys.set(untrusted.issue("node0-new", now, now + 2 * HOUR));
+        keys.set(untrusted.issue());
 
         assertContains(log, reload(g0), ": reloaded " + COMMUNICATION + ", " + DISCOVERY);
         assertTrue(provider(g0).reloadOutcome().successTime() > 0);
-        assertEquals("CN=untrustedca", provider(g0).certificate().getIssuerX500Principal().getName());
+        assertEquals("CN=" + untrustedCaName, provider(g0).certificate().getIssuerX500Principal().getName());
         assertEquals(peerCert, provider(g1).certificate());
 
         assertThrowsWithCause(() -> servedCertificate(peerIssuer.createNew(), discoveryPort(g0)), SSLException.class);
     }
 
-    /** A factory with no certificate metadata can be reloaded, and status reports the missing metadata. */
+    /** Commands reload a store with multiple private keys and report that its certificate metadata is unavailable. */
     @Test
-    public void testUnknownCertificate() throws Exception {
+    public void testCommandsReportUnknownMetadataForMultipleKeys() throws Exception {
         Issuer issuer = new Issuer(this::twoKeys);
 
         IgniteEx g = startClientConnectorOn(issuer);
@@ -144,7 +143,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     /** Replacing one key with several keys must not prevent manual reload. */
     @Test
     public void testReloadCanLoseMetadata() throws Exception {
-        Issuer issuer = new Issuer(fresh(HOUR), this::twoKeys);
+        Issuer issuer = new Issuer(ca::issue, this::twoKeys);
 
         SslContextProvider p = new SslContextProvider(issuer);
         SSLContext inUse = p.context();
@@ -162,8 +161,9 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     /** Reload failures keep the active context and last success time. A successful retry clears the failure history. */
     @Test
     public void testReloadFailureRetainsContextUntilRecovery() throws Exception {
+        String failureReason = "Certificate source is unavailable";
         Callable<KeyStore> unavailable = () -> {
-            throw new IgniteException("Certificate source is unavailable");
+            throw new IgniteException(failureReason);
         };
 
         SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR), fresh(HOUR), unavailable, unavailable, fresh(2 * HOUR)));
@@ -179,14 +179,14 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         for (int failures = 1; failures <= 2; failures++) {
             long attemptStart = System.currentTimeMillis();
 
-            GridTestUtils.assertThrows(log, p::reload, IgniteException.class, "Certificate source is unavailable");
+            GridTestUtils.assertThrows(log, p::reload, IgniteException.class, failureReason);
 
             assertSame(inUse, p.context());
             assertArrayEquals(chain, p.certificateChain());
             assertEquals(lastSuccess, p.reloadOutcome().successTime());
             assertEquals(failures, p.reloadOutcome().failures());
             assertTrue(p.reloadOutcome().failureTime() >= attemptStart);
-            assertContains(log, p.reloadOutcome().failureReason(), "Certificate source is unavailable");
+            assertContains(log, p.reloadOutcome().failureReason(), failureReason);
         }
 
         long recoveryStart = System.currentTimeMillis();
@@ -206,7 +206,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     @Test
     public void testNotYetValidCertificateNotApplied() throws Exception {
         long now = System.currentTimeMillis();
-        Issuer issuer = new Issuer(fresh(HOUR), () -> ca.issue("future", now + HOUR, now + 2 * HOUR));
+        Issuer issuer = new Issuer(ca::issue, () -> ca.issue("future", now + HOUR, now + 2 * HOUR));
         SslContextProvider p = new SslContextProvider(issuer);
         SSLContext inUse = p.context();
         X509Certificate[] chain = p.certificateChain();
@@ -222,16 +222,17 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     @Test
     public void testExpiredIssuerNotApplied() throws Exception {
         long now = System.currentTimeMillis();
-        TestCertificateAuthority expiredCa = new TestCertificateAuthority("expired-ca", now - 2 * HOUR, now - HOUR);
-        KeyStore candidate = expiredCa.issue("valid-leaf", now - MINUTE, now + HOUR);
+        String expiredCaName = "expired-ca";
+        TestCertificateAuthority expiredCa = new TestCertificateAuthority(expiredCaName, now - 2 * HOUR, now - HOUR);
+        KeyStore candidate = expiredCa.issue();
 
-        ((X509Certificate)candidate.getCertificate("valid-leaf")).checkValidity();
+        TestCertificateAuthority.certificateChain(candidate)[0].checkValidity();
 
-        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR), () -> candidate));
+        SslContextProvider p = new SslContextProvider(new Issuer(ca::issue, () -> candidate));
         SSLContext inUse = p.context();
         X509Certificate[] chain = p.certificateChain();
 
-        GridTestUtils.assertThrows(log, p::reload, IgniteCheckedException.class, "subject=CN=expired-ca");
+        GridTestUtils.assertThrows(log, p::reload, IgniteCheckedException.class, "subject=CN=" + expiredCaName);
 
         assertSame(inUse, p.context());
         assertArrayEquals(chain, p.certificateChain());
@@ -241,13 +242,14 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     /** An unsupported protocol in a replacement context leaves the working context in use. */
     @Test
     public void testUnsupportedProtocolNotApplied() {
-        Issuer issuer = new Issuer(fresh(HOUR));
+        String invalidProtocol = "SSLvDoesNotExist";
+        Issuer issuer = new Issuer(ca::issue);
         SslContextProvider p = new SslContextProvider(issuer);
         SSLContext inUse = p.context();
 
-        issuer.setProtocols("SSLvDoesNotExist");
+        issuer.setProtocols(invalidProtocol);
 
-        GridTestUtils.assertThrows(log, p::reload, IllegalArgumentException.class, "SSLvDoesNotExist");
+        GridTestUtils.assertThrows(log, p::reload, IllegalArgumentException.class, invalidProtocol);
 
         assertSame(inUse, p.context());
         assertEquals(1, p.reloadOutcome().failures());
@@ -255,12 +257,13 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
     /** @return Store with two valid private keys and therefore no single chain for certificate metadata. */
     private KeyStore twoKeys() throws Exception {
-        long now = System.currentTimeMillis();
-        KeyStore keys = ca.issue("node", now - MINUTE, now + HOUR);
-        KeyStore other = ca.issue("other", now - MINUTE, now + HOUR);
+        String firstAlias = "first-key";
+        String secondAlias = "second-key";
+        KeyStore keys = ca.issue(firstAlias);
+        KeyStore other = ca.issue(secondAlias);
 
-        keys.setKeyEntry("other", other.getKey("other", TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
-            other.getCertificateChain("other"));
+        keys.setKeyEntry(secondAlias, other.getKey(secondAlias, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
+            other.getCertificateChain(secondAlias));
 
         return keys;
     }
@@ -303,10 +306,8 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
      * @param peerCa Authority of the peer whose certificate stays unchanged.
      */
     private void checkNodeRotation(TestCertificateAuthority peerCa) throws Exception {
-        long now = System.currentTimeMillis();
-
-        AtomicReference<KeyStore> keys = new AtomicReference<>(ca.issue("node0", now - HOUR, now + 9 * MINUTE));
-        KeyStore peerKeys = peerCa.issue("node1", now - MINUTE, now + HOUR);
+        AtomicReference<KeyStore> keys = new AtomicReference<>(ca.issue());
+        KeyStore peerKeys = peerCa.issue();
         Issuer issuer = issuer(keys::get, peerCa.trustStore());
         Issuer peerIssuer = issuer(() -> peerKeys, ca.trustStore());
 
@@ -318,8 +319,8 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         assertFalse(provider(g0).certificate().equals(peerCert));
         assertComputeWorks(g0, g1);
 
-        KeyStore replacement = ca.issue("node0-new", now, now + 2 * HOUR);
-        X509Certificate replacementCert = (X509Certificate)replacement.getCertificate("node0-new");
+        KeyStore replacement = ca.issue();
+        X509Certificate replacementCert = TestCertificateAuthority.certificateChain(replacement)[0];
 
         keys.set(replacement);
 
