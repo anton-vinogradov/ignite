@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.ignite.internal.ssl;
+package org.apache.ignite.testframework;
 
 import java.io.OutputStream;
 import java.math.BigInteger;
@@ -49,11 +49,11 @@ import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 
 /**
- * Certificate authority for tests that need certificates valid for a chosen time, which the stores checked into the repository cannot give.
+ * Certificate authority for tests that need explicit keys, trust relationships and certificate validity periods.
  */
-class TestCertificateAuthority {
+public class TestCertificateAuthority {
     /** Password of every store made here. */
-    static final char[] PWD = "123456".toCharArray();
+    public static final char[] PWD = "123456".toCharArray();
 
     /** */
     private static final SecureRandom RND = new SecureRandom();
@@ -68,13 +68,20 @@ class TestCertificateAuthority {
     private final X509Certificate cert;
 
     /** @param cn Common name of the authority. */
-    TestCertificateAuthority(String cn) throws Exception {
+    public TestCertificateAuthority(String cn) throws Exception {
+        this(cn, System.currentTimeMillis() - TimeUnit.DAYS.toMillis(1), System.currentTimeMillis() + TimeUnit.DAYS.toMillis(365));
+    }
+
+    /**
+     * @param cn Common name of the authority.
+     * @param notBefore Time the authority's certificate becomes valid; rounded down to a second.
+     * @param notAfter Time the authority's certificate expires; rounded down to a second.
+     */
+    public TestCertificateAuthority(String cn, long notBefore, long notAfter) throws Exception {
         name = new X500Principal("CN=" + cn);
         keys = keyPair();
 
-        long now = System.currentTimeMillis();
-
-        cert = sign(name, keys, now - TimeUnit.DAYS.toMillis(1), now + TimeUnit.DAYS.toMillis(365), true);
+        cert = sign(name, keys, notBefore, notAfter, true);
     }
 
     /**
@@ -83,7 +90,7 @@ class TestCertificateAuthority {
      * @param notAfter Time it expires; rounded down to a second.
      * @return Key store with the private key and a chain containing the issued certificate and this authority's certificate.
      */
-    KeyStore issue(String cn, long notBefore, long notAfter) throws Exception {
+    public KeyStore issue(String cn, long notBefore, long notAfter) throws Exception {
         return issue(cn, new X500Principal("CN=" + cn), keyPair(), notBefore, notAfter);
     }
 
@@ -95,7 +102,7 @@ class TestCertificateAuthority {
      * @param notAfter Time it expires; rounded down to a second.
      * @return Key store with the private key and a chain containing the issued certificate and this authority's certificate.
      */
-    KeyStore issue(String alias, X500Principal subject, KeyPair pair, long notBefore, long notAfter) throws Exception {
+    public KeyStore issue(String alias, X500Principal subject, KeyPair pair, long notBefore, long notAfter) throws Exception {
         X509Certificate leaf = sign(subject, pair, notBefore, notAfter, false);
 
         KeyStore store = emptyStore();
@@ -106,7 +113,7 @@ class TestCertificateAuthority {
     }
 
     /** @return Trust store with this authority alone. */
-    KeyStore trustStore() throws Exception {
+    public KeyStore trustStore() throws Exception {
         return trustStore(this);
     }
 
@@ -114,7 +121,7 @@ class TestCertificateAuthority {
      * @param authorities Authorities to trust.
      * @return Trust store with them.
      */
-    static KeyStore trustStore(TestCertificateAuthority... authorities) throws Exception {
+    public static KeyStore trustStore(TestCertificateAuthority... authorities) throws Exception {
         KeyStore store = emptyStore();
 
         for (TestCertificateAuthority a : authorities)
@@ -128,7 +135,7 @@ class TestCertificateAuthority {
      * @param trustStore Store with the authorities to trust.
      * @return Context using the supplied key and trust stores, with certificate metadata attached.
      */
-    static SSLContext context(KeyStore keyStore, KeyStore trustStore) throws Exception {
+    public static SSLContext context(KeyStore keyStore, KeyStore trustStore) throws Exception {
         SSLContext ctx = SSLContext.getInstance("TLS");
 
         ctx.init(keyManagers(keyStore), trustManagers(trustStore), null);
@@ -140,7 +147,7 @@ class TestCertificateAuthority {
      * @param keyStore Store with at most one private key.
      * @return Its certificate chain, or {@code null} if the store has no private key.
      */
-    static X509Certificate[] certificateChain(KeyStore keyStore) throws Exception {
+    public static X509Certificate[] certificateChain(KeyStore keyStore) throws Exception {
         X509Certificate[] chain = null;
 
         for (String alias : Collections.list(keyStore.aliases())) {
@@ -162,7 +169,7 @@ class TestCertificateAuthority {
      * @param keyStore Store with the certificate to present.
      * @return Key managers that present it.
      */
-    static KeyManager[] keyManagers(KeyStore keyStore) throws Exception {
+    public static KeyManager[] keyManagers(KeyStore keyStore) throws Exception {
         KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
 
         kmf.init(keyStore, PWD);
@@ -174,7 +181,7 @@ class TestCertificateAuthority {
      * @param trustStore Store with the authorities to trust.
      * @return Trust managers that trust them.
      */
-    static TrustManager[] trustManagers(KeyStore trustStore) throws Exception {
+    public static TrustManager[] trustManagers(KeyStore trustStore) throws Exception {
         TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
 
         tmf.init(trustStore);
@@ -186,7 +193,7 @@ class TestCertificateAuthority {
      * @param store Store.
      * @param path File to write or replace.
      */
-    static void save(KeyStore store, Path path) throws Exception {
+    public static void save(KeyStore store, Path path) throws Exception {
         try (OutputStream out = Files.newOutputStream(path)) {
             store.store(out, PWD);
         }
