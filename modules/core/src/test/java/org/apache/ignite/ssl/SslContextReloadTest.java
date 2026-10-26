@@ -159,8 +159,8 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         long leafExpiry = now + 2 * HOUR;
 
         newCa = new TestCertificateAuthority("new-ca", now - HOUR, issuerExpiry);
-        oldKeys = oldCa.issue(OLD_NODE);
-        newKeys = newCa.issue(NEW_NODE, now - HOUR, leafExpiry);
+        oldKeys = oldCa.keyStoreWithPrivateKey(OLD_NODE);
+        newKeys = newCa.keyStoreWithPrivateKey(NEW_NODE, now - HOUR, leafExpiry);
         oldCert = certificateChain(oldKeys)[0];
         newCert = certificateChain(newKeys)[0];
         trustBoth = TestCertificateAuthority.trustStore(oldCa, newCa);
@@ -180,6 +180,8 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
      */
     @Test
     public void testReloadOnRunningCluster() throws Exception {
+        initTrustStore = trustBoth;
+
         X509Certificate[] replacementChain = certificateChain(newKeys);
         long issuerExpiry = replacementChain[1].getNotAfter().getTime();
 
@@ -363,7 +365,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
         nodeFactory.fail = true;
 
-        KeyStore nextKeys = newCa.issue();
+        KeyStore nextKeys = newCa.keyStoreWithPrivateKey();
 
         placeKeys(nextKeys);
 
@@ -426,9 +428,9 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
     @Test
     public void testClientTransportsWithSeparateFactories() throws Exception {
         initTrustStore = oldCa.trustStore();
-        KeyStore clientKeys = oldCa.issue();
-        KeyStore restKeys = oldCa.issue();
-        KeyStore nextRestKeys = newCa.issue();
+        KeyStore clientKeys = oldCa.keyStoreWithPrivateKey();
+        KeyStore restKeys = oldCa.keyStoreWithPrivateKey();
+        KeyStore nextRestKeys = newCa.keyStoreWithPrivateKey();
         Path clientPath = dir.resolve("client-key.jks");
         Path restPath = dir.resolve("binary-rest-key.jks");
 
@@ -467,7 +469,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         assertEquals(certificateChain(nextRestKeys)[0], certificateAt(restPort));
     }
 
-    /** Manual reload accepts several keys, reports unavailable metadata and keeps existing and new TLS connections working. */
+    /** Manual reload accepts several keys without metadata. Client operations and new TLS connections still work. */
     @Test
     public void testKeyStoreWithMultipleKeysReloadedWithoutMetadata() throws Exception {
         ownClientConnectorFactory = true;
@@ -556,7 +558,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
         assertEquals((Integer)1, g0.compute(g0.cluster().forNodeId(g1.localNode().id())).call(() -> 1));
 
-        TestCertificateAuthority.save(newCa.issue(), keyStore(getTestIgniteInstanceName(2)));
+        TestCertificateAuthority.save(newCa.keyStoreWithPrivateKey(), keyStore(getTestIgniteInstanceName(2)));
         TestCertificateAuthority.save(newCa.trustStore(), trustStore(getTestIgniteInstanceName(2)));
 
         IgniteEx g2 = startGrid(2);
@@ -727,7 +729,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
     /** @return Store with an expired leaf issued by the replacement authority. */
     private KeyStore expiredKeys() throws Exception {
-        return newCa.issue("expired-node", now - 2 * HOUR, now - HOUR);
+        return newCa.keyStoreWithPrivateKey("expired-node", now - 2 * HOUR, now - HOUR);
     }
 
     /** */
