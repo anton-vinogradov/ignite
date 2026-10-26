@@ -45,8 +45,6 @@ import org.eclipse.jetty.server.SslConnectionFactory;
 import org.junit.Test;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
-import static java.util.concurrent.TimeUnit.DAYS;
-import static java.util.concurrent.TimeUnit.HOURS;
 import static org.apache.ignite.internal.IgniteNodeAttributes.ATTR_REST_JETTY_PORT;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.HTTP_REST;
 import static org.apache.ignite.ssl.SslTestUtils.assertClientAuthentication;
@@ -57,6 +55,7 @@ import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.TestCertificateAuthority.PWD;
+import static org.apache.ignite.testframework.TestCertificateAuthority.certificateChain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.save;
 import static org.junit.Assert.assertArrayEquals;
 
@@ -74,6 +73,12 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     /** Jetty configuration with a connector that expects the PROXY protocol before HTTP. */
     private static final String JETTY_PROXY = "modules/rest-http/src/test/resources/jetty-proxy.xml";
 
+    /** Host named by the original server certificate. */
+    private static final String OLD_SERVER_HOST = "node01";
+
+    /** Host named by the replacement server certificate. */
+    private static final String NEW_SERVER_HOST = "node02";
+
     /** Key store HTTP REST runs on; replaced on disk to rotate the certificate. */
     private Path keyStore;
 
@@ -85,6 +90,12 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
 
     /** Replacement server key and certificate signed by the new authority. */
     private KeyStore newServerKeys;
+
+    /** Certificate initially served over HTTPS. */
+    private X509Certificate oldCert;
+
+    /** Certificate served over HTTPS after reload. */
+    private X509Certificate newCert;
 
     /** Client key and certificate signed by the old authority. */
     private KeyStore oldClientKeys;
@@ -142,12 +153,13 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     @Override protected void beforeTest() throws Exception {
         TestCertificateAuthority oldCa = new TestCertificateAuthority("old-http-ca");
         TestCertificateAuthority newCa = new TestCertificateAuthority("new-http-ca");
-        long now = System.currentTimeMillis();
 
-        oldServerKeys = oldCa.issue("node01", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
-        newServerKeys = newCa.issue("node02", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
-        oldClientKeys = oldCa.issue("client01", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
-        newClientKeys = newCa.issue("client02", now - HOURS.toMillis(1), now + DAYS.toMillis(1));
+        oldServerKeys = oldCa.issue(OLD_SERVER_HOST);
+        newServerKeys = newCa.issue(NEW_SERVER_HOST);
+        oldCert = certificateChain(oldServerKeys)[0];
+        newCert = certificateChain(newServerKeys)[0];
+        oldClientKeys = oldCa.issue();
+        newClientKeys = newCa.issue();
         oldTrust = oldCa.trustStore();
         newTrust = newCa.trustStore();
         bothTrust = TestCertificateAuthority.trustStore(oldCa, newCa);
@@ -182,18 +194,18 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         SSLContext client = trustedClient();
 
         try (SSLSocket open = socket(client, port(g))) {
-            assertEquals("CN=node01", serverSubject(open));
+            assertEquals(oldCert, serverCertificate(open));
 
             save(newServerKeys, keyStore);
 
             assertContains(log, reload(g), ": reloaded " + HTTP_REST);
-            assertVersionResponse(open, "node01");
+            assertVersionResponse(open, OLD_SERVER_HOST);
         }
 
         try (SSLSocket after = socket(client, port(g))) {
-            assertEquals("CN=node02", serverSubject(after));
+            assertEquals(newCert, serverCertificate(after));
 
-            assertVersionResponse(after, "node02");
+            assertVersionResponse(after, NEW_SERVER_HOST);
         }
 
         try (SSLSocket byIp = socket(client, port(g))) {
@@ -201,15 +213,15 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         }
 
         try (SSLSocket anonymous = socket(clientContext(null, bothTrust), port(g))) {
-            assertVersionResponse(anonymous, "node02");
+            assertVersionResponse(anonymous, NEW_SERVER_HOST);
         }
 
-        assertContains(log, status(g), "loaded subject=CN=node02,");
+        assertContains(log, status(g), "loaded subject=" + newCert.getSubjectX500Principal().getName() + ',');
 
         Files.write(keyStore, "not a key store".getBytes());
 
         assertContains(log, reloadFailure(g), "failed on " + HTTP_REST);
-        assertEquals(newServerKeys.getCertificate("node02"), servedCertificate(trustedClient(), port(g)));
+        assertEquals(newCert, servedCertificate(trustedClient(), port(g)));
     }
 
     /** Factory TLS settings survive reload while Jetty's cipher exclusions still apply. */
@@ -221,8 +233,11 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
             .filter(cipher -> Arrays.stream(excludePatterns).anyMatch(cipher::matches))
             .findFirst().orElseThrow(() -> new AssertionError("The JVM must support a cipher suite excluded by Jetty"));
 
-        protocols = new String[] {"TLSv1.2"};
-        cipherSuites = new String[] {"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", excluded};
+        String protocol = "TLSv1.2";
+        String enabledCipher = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256";
+
+        protocols = new String[] {protocol};
+        cipherSuites = new String[] {enabledCipher, excluded};
 
         IgniteEx g = startGrid(0);
 
@@ -230,12 +245,12 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
 
         // Check the engines directly: JVM handshake policy can independently reject legacy cipher suites.
         assertArrayEquals(cipherSuites, jetty.getSslContext().createSSLEngine().getEnabledCipherSuites());
-        assertArrayEquals(new String[] {cipherSuites[0]}, jetty.newSSLEngine().getEnabledCipherSuites());
+        assertArrayEquals(new String[] {enabledCipher}, jetty.newSSLEngine().getEnabledCipherSuites());
 
         try (SSLSocket sock = socket(trustedClient(), port(g))) {
-            assertEquals("CN=node01", serverSubject(sock));
-            assertEquals(protocols[0], sock.getSession().getProtocol());
-            assertEquals(cipherSuites[0], sock.getSession().getCipherSuite());
+            assertEquals(oldCert, serverCertificate(sock));
+            assertEquals(protocol, sock.getSession().getProtocol());
+            assertEquals(enabledCipher, sock.getSession().getCipherSuite());
         }
 
         save(newServerKeys, keyStore);
@@ -243,12 +258,12 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         assertContains(log, reload(g), ": reloaded " + HTTP_REST);
 
         assertArrayEquals(cipherSuites, jetty.getSslContext().createSSLEngine().getEnabledCipherSuites());
-        assertArrayEquals(new String[] {cipherSuites[0]}, jetty.newSSLEngine().getEnabledCipherSuites());
+        assertArrayEquals(new String[] {enabledCipher}, jetty.newSSLEngine().getEnabledCipherSuites());
 
         try (SSLSocket sock = socket(trustedClient(), port(g))) {
-            assertEquals("CN=node02", serverSubject(sock));
-            assertEquals(protocols[0], sock.getSession().getProtocol());
-            assertEquals(cipherSuites[0], sock.getSession().getCipherSuite());
+            assertEquals(newCert, serverCertificate(sock));
+            assertEquals(protocol, sock.getSession().getProtocol());
+            assertEquals(enabledCipher, sock.getSession().getCipherSuite());
         }
     }
 
@@ -260,7 +275,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         IgniteEx g = startGrid(0);
 
         try (SSLSocket sock = socket(trustedClient(), port(g))) {
-            assertEquals("CN=node01", serverSubject(sock));
+            assertEquals(oldCert, serverCertificate(sock));
 
             String headers = assertVersionResponse(sock, "localhost");
 
@@ -292,7 +307,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
 
         // Keep the original XML and its checked-in stores as the legacy configuration compatibility check.
         try (SSLSocket sock = socket(GridTestUtils.sslTrustedFactory("node01", "trustboth").create(), port(g))) {
-            assertEquals("CN=node01", serverSubject(sock));
+            assertEquals("CN=node01", serverCertificate(sock).getSubjectX500Principal().getName());
             assertVersionResponse(sock, "node01");
         }
 
@@ -331,7 +346,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         assertClientAuthentication(port, oldClientKeys, newClientKeys, bothTrust);
 
         try (SSLSocket sock = socket(clientContext(oldClientKeys, bothTrust), port)) {
-            assertVersionResponse(sock, "node01");
+            assertVersionResponse(sock, OLD_SERVER_HOST);
         }
 
         save(newServerKeys, keyStore);
@@ -342,8 +357,8 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         assertClientAuthentication(port, newClientKeys, oldClientKeys, bothTrust);
 
         try (SSLSocket sock = socket(clientContext(newClientKeys, bothTrust), port)) {
-            assertEquals("CN=node02", serverSubject(sock));
-            assertVersionResponse(sock, "node02");
+            assertEquals(newCert, serverCertificate(sock));
+            assertVersionResponse(sock, NEW_SERVER_HOST);
         }
     }
 
@@ -388,11 +403,11 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         }
     }
 
-    /** @return Subject of the certificate the server presents on the connection. */
-    private static String serverSubject(SSLSocket sock) throws IOException {
+    /** @return Certificate the server presents on the connection. */
+    private static X509Certificate serverCertificate(SSLSocket sock) throws IOException {
         sock.startHandshake();
 
-        return ((X509Certificate)sock.getSession().getPeerCertificates()[0]).getSubjectX500Principal().getName();
+        return (X509Certificate)sock.getSession().getPeerCertificates()[0];
     }
 
     /**
