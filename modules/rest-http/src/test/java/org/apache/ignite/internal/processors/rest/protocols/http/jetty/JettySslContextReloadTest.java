@@ -65,7 +65,8 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     private static final int SOCKET_TIMEOUT = 30_000;
 
     /** Jetty configuration with a plain connector and an explicit secure request customizer. */
-    private static final String JETTY_PLAIN = "modules/rest-http/src/test/resources/jetty-http-customizer.xml";
+    private static final String JETTY_HSTS_WITHOUT_HOST_CHECK =
+        "modules/rest-http/src/test/resources/jetty-http-customizer.xml";
 
     /** Jetty configuration with a connector that has an SSL connection factory of its own. */
     private static final String JETTY_SSL = "modules/rest-http/src/test/resources/jetty-ssl.xml";
@@ -154,12 +155,12 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         TestCertificateAuthority oldCa = new TestCertificateAuthority("old-http-ca");
         TestCertificateAuthority newCa = new TestCertificateAuthority("new-http-ca");
 
-        oldServerKeys = oldCa.issue(OLD_SERVER_HOST);
-        newServerKeys = newCa.issue(NEW_SERVER_HOST);
+        oldServerKeys = oldCa.keyStoreWithPrivateKey(OLD_SERVER_HOST);
+        newServerKeys = newCa.keyStoreWithPrivateKey(NEW_SERVER_HOST);
         oldCert = certificateChain(oldServerKeys)[0];
         newCert = certificateChain(newServerKeys)[0];
-        oldClientKeys = oldCa.issue();
-        newClientKeys = newCa.issue();
+        oldClientKeys = oldCa.keyStoreWithPrivateKey();
+        newClientKeys = newCa.keyStoreWithPrivateKey();
         oldTrust = oldCa.trustStore();
         newTrust = newCa.trustStore();
         bothTrust = TestCertificateAuthority.trustStore(oldCa, newCa);
@@ -189,9 +190,11 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
      */
     @Test
     public void testReload() throws Exception {
+        clientAuth = false;
+
         IgniteEx g = startGrid(0);
 
-        SSLContext client = trustedClient();
+        SSLContext client = clientTrustingBothAuthorities();
 
         try (SSLSocket open = socket(client, port(g))) {
             assertEquals(oldCert, serverCertificate(open));
@@ -221,7 +224,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         Files.write(keyStore, "not a key store".getBytes());
 
         assertContains(log, reloadFailure(g), "failed on " + HTTP_REST);
-        assertEquals(newCert, servedCertificate(trustedClient(), port(g)));
+        assertEquals(newCert, servedCertificate(clientTrustingBothAuthorities(), port(g)));
     }
 
     /** Factory TLS settings survive reload while Jetty's cipher exclusions still apply. */
@@ -229,7 +232,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     public void testFactoryProtocolsAndCipherSuites() throws Exception {
         String[] excludePatterns = new org.eclipse.jetty.util.ssl.SslContextFactory.Server().getExcludeCipherSuites();
 
-        String excluded = Arrays.stream(trustedClient().getSupportedSSLParameters().getCipherSuites())
+        String excluded = Arrays.stream(clientTrustingBothAuthorities().getSupportedSSLParameters().getCipherSuites())
             .filter(cipher -> Arrays.stream(excludePatterns).anyMatch(cipher::matches))
             .findFirst().orElseThrow(() -> new AssertionError("The JVM must support a cipher suite excluded by Jetty"));
 
@@ -247,7 +250,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         assertArrayEquals(cipherSuites, jetty.getSslContext().createSSLEngine().getEnabledCipherSuites());
         assertArrayEquals(new String[] {enabledCipher}, jetty.newSSLEngine().getEnabledCipherSuites());
 
-        try (SSLSocket sock = socket(trustedClient(), port(g))) {
+        try (SSLSocket sock = socket(clientTrustingBothAuthorities(), port(g))) {
             assertEquals(oldCert, serverCertificate(sock));
             assertEquals(protocol, sock.getSession().getProtocol());
             assertEquals(enabledCipher, sock.getSession().getCipherSuite());
@@ -260,7 +263,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         assertArrayEquals(cipherSuites, jetty.getSslContext().createSSLEngine().getEnabledCipherSuites());
         assertArrayEquals(new String[] {enabledCipher}, jetty.newSSLEngine().getEnabledCipherSuites());
 
-        try (SSLSocket sock = socket(trustedClient(), port(g))) {
+        try (SSLSocket sock = socket(clientTrustingBothAuthorities(), port(g))) {
             assertEquals(newCert, serverCertificate(sock));
             assertEquals(protocol, sock.getSession().getProtocol());
             assertEquals(enabledCipher, sock.getSession().getCipherSuite());
@@ -270,11 +273,11 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     /** A connector from a Jetty configuration file gets TLS and keeps its HSTS and host-check settings. */
     @Test
     public void testJettyConnectorFromFileGetsTls() throws Exception {
-        jettyPath = JETTY_PLAIN;
+        jettyPath = JETTY_HSTS_WITHOUT_HOST_CHECK;
 
         IgniteEx g = startGrid(0);
 
-        try (SSLSocket sock = socket(trustedClient(), port(g))) {
+        try (SSLSocket sock = socket(clientTrustingBothAuthorities(), port(g))) {
             assertEquals(oldCert, serverCertificate(sock));
 
             String headers = assertVersionResponse(sock, "localhost");
@@ -283,7 +286,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
                 headers.lines().anyMatch("Strict-Transport-Security: max-age=86400"::equalsIgnoreCase));
         }
 
-        try (SSLSocket byIp = socket(trustedClient(), port(g))) {
+        try (SSLSocket byIp = socket(clientTrustingBothAuthorities(), port(g))) {
             assertVersionResponse(byIp, "127.0.0.1");
         }
     }
@@ -373,7 +376,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     }
 
     /** @return A fresh client context that trusts both server authorities. */
-    private SSLContext trustedClient() throws Exception {
+    private SSLContext clientTrustingBothAuthorities() throws Exception {
         return clientContext(oldClientKeys, bothTrust);
     }
 
