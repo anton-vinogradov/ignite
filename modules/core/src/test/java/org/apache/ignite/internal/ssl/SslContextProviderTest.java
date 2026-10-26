@@ -166,11 +166,11 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
             throw new IgniteException(failureReason);
         };
 
-        Callable<KeyStore> initialKeys = freshKeysValidFor(HOUR);
+        Callable<KeyStore> startupKeys = freshKeysValidFor(HOUR);
         Callable<KeyStore> successfulReloadKeys = freshKeysValidFor(HOUR);
         Callable<KeyStore> recoveryKeys = freshKeysValidFor(2 * HOUR);
         ScriptedSslContextFactory factory = new ScriptedSslContextFactory(
-            initialKeys, successfulReloadKeys, unavailable, unavailable, recoveryKeys);
+            startupKeys, successfulReloadKeys, unavailable, unavailable, recoveryKeys);
         SslContextProvider p = new SslContextProvider(factory);
 
         p.reload();
