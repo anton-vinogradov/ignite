@@ -228,6 +228,10 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * A subclass that only changes the key source can override {@link #createKeyMaterial()} instead. When building a context
      * through another mechanism, attach its loaded certificate chain, if known, using
      * {@link SSLContextWrapper#SSLContextWrapper(SSLContext, SSLParameters, X509Certificate[])}.
+     * <p>
+     * The node calls this method for {@code control.sh --ssl reload}. Calls for the same factory on a node never overlap;
+     * calls for different factories may run at the same time. A subclass that fetches certificates from a remote source must
+     * limit how long a call takes and stop when its thread is interrupted.
      *
      * @return New initialized SSL context.
      * @throws IgniteException If the context could not be created.
