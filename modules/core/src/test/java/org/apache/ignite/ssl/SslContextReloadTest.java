@@ -37,13 +37,17 @@ import org.apache.ignite.configuration.ClientConnectorConfiguration;
 import org.apache.ignite.configuration.ConnectorConfiguration;
 import org.apache.ignite.configuration.IgniteConfiguration;
 import org.apache.ignite.internal.IgniteEx;
+import org.apache.ignite.internal.management.api.NoArg;
+import org.apache.ignite.internal.management.ssl.AbstractSslTask;
 import org.apache.ignite.internal.management.ssl.SslReloadTask;
+import org.apache.ignite.internal.management.ssl.SslStatusTask;
 import org.apache.ignite.internal.ssl.SslCertificates;
 import org.apache.ignite.internal.ssl.SslContextProvider;
 import org.apache.ignite.internal.ssl.SslContextRegistry;
 import org.apache.ignite.internal.util.typedef.G;
 import org.apache.ignite.internal.util.typedef.X;
 import org.apache.ignite.internal.util.typedef.internal.U;
+import org.apache.ignite.internal.visor.VisorTaskArgument;
 import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
 import org.apache.ignite.spi.communication.tcp.internal.ConnectionClientPool;
 import org.apache.ignite.testframework.GridTestNode;
@@ -513,6 +517,28 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         Throwable e = GridTestUtils.assertThrows(log, () -> new SslReloadTask().reduce(List.of(res)).result(), IgniteException.class, null);
 
         assertContains(log, e.getMessage(), "Failed on 1 node(s):\n" + n.id() + " [consistentId=cid]: node left");
+    }
+
+    /** A target missing at mapping fails both commands without preventing work on the remaining node. */
+    @Test
+    public void testUnavailableNodeDoesNotSkipRemainingNode() throws Exception {
+        IgniteEx g = startGrid(0);
+        UUID unavailable = UUID.randomUUID();
+
+        placeKeys("node02");
+
+        VisorTaskArgument<NoArg> arg = new VisorTaskArgument<>(List.of(g.localNode().id(), unavailable), new NoArg(), false);
+
+        for (Class<? extends AbstractSslTask> task : List.of(SslReloadTask.class, SslStatusTask.class)) {
+            Throwable err = GridTestUtils.assertThrows(log, () -> g.compute().execute(task, arg).result(), IgniteException.class, null);
+
+            assertContains(log, err.getMessage(), "Failed on 1 node(s):\n" + unavailable +
+                ": node was unavailable to run the command");
+            assertContains(log, err.getMessage(), "Succeeded on 1 node(s):\n" + node(g) + ':');
+            assertContains(log, err.getMessage(), "loaded subject=CN=node02,");
+        }
+
+        assertEquals("CN=node02", servedSubject(g.context().clientListener().port()));
     }
 
     /** Both commands report that no SSL context factory is configured. */
