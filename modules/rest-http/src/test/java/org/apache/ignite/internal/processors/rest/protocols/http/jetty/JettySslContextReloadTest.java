@@ -24,16 +24,22 @@ import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.cert.X509Certificate;
+import java.util.Arrays;
+import java.util.Collection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.configuration.ConnectorConfiguration;
 import org.apache.ignite.configuration.IgniteConfiguration;
 import org.apache.ignite.internal.IgniteEx;
+import org.apache.ignite.internal.processors.rest.GridRestProtocol;
 import org.apache.ignite.internal.util.typedef.internal.U;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.server.SslConnectionFactory;
 import org.junit.Test;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
@@ -48,6 +54,7 @@ import static org.apache.ignite.ssl.SslTestUtils.servedSubject;
 import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.GridTestUtils.keyStorePassword;
+import static org.junit.Assert.assertArrayEquals;
 
 /** Tests HTTP REST certificate reload through {@link ConnectorConfiguration#setHttpSslFactory}. */
 public class JettySslContextReloadTest extends GridCommonAbstractTest {
@@ -166,13 +173,25 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         assertEquals("CN=node02", servedSubject(port(g)));
     }
 
-    /** Jetty preserves the factory's protocols and cipher suites when starting and after a certificate reload. */
+    /** Factory TLS settings survive reload while Jetty's cipher exclusions still apply. */
     @Test
     public void testFactoryProtocolsAndCipherSuites() throws Exception {
+        String[] excludePatterns = new org.eclipse.jetty.util.ssl.SslContextFactory.Server().getExcludeCipherSuites();
+
+        String excluded = Arrays.stream(trustedClient().getSupportedSSLParameters().getCipherSuites())
+            .filter(cipher -> Arrays.stream(excludePatterns).anyMatch(cipher::matches))
+            .findFirst().orElseThrow(() -> new AssertionError("The JVM must support a cipher suite excluded by Jetty"));
+
         protocols = new String[] {"TLSv1.2"};
-        cipherSuites = new String[] {"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"};
+        cipherSuites = new String[] {"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", excluded};
 
         IgniteEx g = startGrid(0);
+
+        org.eclipse.jetty.util.ssl.SslContextFactory jetty = jettySslFactory(g);
+
+        // Check the engines directly: JVM handshake policy can independently reject legacy cipher suites.
+        assertArrayEquals(cipherSuites, jetty.getSslContext().createSSLEngine().getEnabledCipherSuites());
+        assertArrayEquals(new String[] {cipherSuites[0]}, jetty.newSSLEngine().getEnabledCipherSuites());
 
         try (SSLSocket sock = socket(trustedClient(), port(g))) {
             assertEquals("CN=node01", serverSubject(sock));
@@ -183,6 +202,9 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         place("node02", keyStore);
 
         assertContains(log, reload(g), ": reloaded " + HTTP_REST);
+
+        assertArrayEquals(cipherSuites, jetty.getSslContext().createSSLEngine().getEnabledCipherSuites());
+        assertArrayEquals(new String[] {cipherSuites[0]}, jetty.newSSLEngine().getEnabledCipherSuites());
 
         try (SSLSocket sock = socket(trustedClient(), port(g))) {
             assertEquals("CN=node02", serverSubject(sock));
@@ -283,6 +305,16 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
             assertEquals("CN=node02", serverSubject(sock));
             assertVersionResponse(sock, "node02");
         }
+    }
+
+    /** @return SSL factory used by the running Jetty connector. */
+    private static org.eclipse.jetty.util.ssl.SslContextFactory jettySslFactory(IgniteEx g) {
+        Collection<GridRestProtocol> protos = GridTestUtils.getFieldValue(g.context().rest(), "protos");
+
+        GridRestProtocol jetty = protos.stream().filter(GridJettyRestProtocol.class::isInstance).findFirst().orElseThrow();
+        Server srv = GridTestUtils.getFieldValue(jetty, "httpSrv");
+
+        return ((ServerConnector)srv.getConnectors()[0]).getConnectionFactory(SslConnectionFactory.class).getSslContextFactory();
     }
 
     /** @return A new client context with the trusted node certificate. */
