@@ -182,6 +182,9 @@ public class SslContextProvider {
         try {
             SSLContext rebuilt = build();
 
+            if (Thread.currentThread().isInterrupted())
+                throw new IgniteInterruptedCheckedException("TLS certificate renewal was interrupted");
+
             X509Certificate[] next = certificateChain(rebuilt);
             X509Certificate[] chain = certificateChain(ctx);
 

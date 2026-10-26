@@ -34,6 +34,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import javax.net.ssl.KeyManager;
@@ -45,6 +46,7 @@ import org.apache.ignite.IgniteException;
 import org.apache.ignite.configuration.ClientConnectorConfiguration;
 import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.internal.IgniteInternalFuture;
+import org.apache.ignite.internal.IgniteInterruptedCheckedException;
 import org.apache.ignite.internal.thread.context.OperationContext;
 import org.apache.ignite.internal.thread.context.OperationContextAttribute;
 import org.apache.ignite.internal.thread.context.Scope;
@@ -56,6 +58,7 @@ import org.apache.ignite.ssl.AbstractSslContextFactory;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.MemorizingAppender;
+import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.core.LogEvent;
@@ -131,19 +134,28 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testRenewsBeforeExpiry() throws Exception {
         long now = System.currentTimeMillis();
-        long notAfter = (now + 40_000) / 1000 * 1000;
-        long notBefore = notAfter - 233_000;
-        long due = notAfter - (long)((notAfter - notBefore) * DFLT_RENEW_BEFORE_FRACTION);
+        AtomicLong due = new AtomicLong();
 
-        assertTrue("The window must open seconds after the node starts, well before expiry", due - now > 3_000 && notAfter - due > 30_000);
+        Issuer issuer = new Issuer(() -> {
+            long issued = System.currentTimeMillis();
+            long notAfter = (issued + 40_000) / 1000 * 1000;
+            long notBefore = notAfter - 233_000;
 
-        IgniteEx g = startNode(new Issuer(valid(notBefore, notAfter), fresh(HOUR)));
+            due.set(notAfter - (long)((notAfter - notBefore) * DFLT_RENEW_BEFORE_FRACTION));
+
+            assertTrue("The window must open after the first load and well before expiry",
+                due.get() - issued > 3_000 && notAfter - due.get() > 30_000);
+
+            return ca.issue("node", notBefore, notAfter);
+        }, fresh(HOUR));
+
+        IgniteEx g = startNode(issuer);
 
         assertTrue(waitForCondition(() -> automaticRenewals("transports=" + COMMUNICATION) == 1, 30_000));
 
         assertTrue("The certificate must have been renewed", chainNotAfter(g) > now + 30 * MINUTE);
         assertTrue("The renewal must not come before the window opens",
-            provider(g).reloadOutcome().successTime() >= due - CLOCK_SLACK);
+            issuer.calls.get(1).time >= due.get() - CLOCK_SLACK);
         assertEquals("New connections must get the renewed certificate", chainNotAfter(g),
             servedCertificate(probe(), discoveryPort(g)).getNotAfter().getTime());
 
@@ -723,7 +735,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         CountDownLatch entered = new CountDownLatch(1);
 
-        Issuer issuer = new Issuer(valid(now - HOUR, now + 9 * MINUTE), () -> {
+        Issuer issuer = new Issuer(fresh(HOUR), valid(now - HOUR, now + 9 * MINUTE), () -> {
             entered.countDown();
 
             Thread.sleep(Long.MAX_VALUE);
@@ -732,16 +744,70 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         });
 
         IgniteEx g = startNode(issuer);
-
-        assertTrue(entered.await(30, TimeUnit.SECONDS));
-
         SslContextProvider p = provider(g);
+
+        p.reload();
+
+        SslContextProvider.ReloadOutcome outcome = p.reloadOutcome();
+
+        assertTrue(outcome.successTime() > 0);
+        assertTrue(entered.await(30, TimeUnit.SECONDS));
 
         stopGrid(0);
 
         assertEquals(0, p.renewalFailures());
-        assertEquals(0, p.reloadOutcome().failures());
+        assertEquals(outcome, p.reloadOutcome());
         assertTrue(appender.events().stream().noneMatch(e -> e.getLevel().isMoreSpecificThan(Level.WARN)));
+    }
+
+    /** A loader returning after interruption must not replace the context or change recorded reload and renewal results. */
+    @Test
+    public void testInterruptedRenewalReturnPreservesState() throws Exception {
+        long now = System.currentTimeMillis();
+        KeyStore original = ca.issue("original", now - HOUR, now + HOUR);
+        KeyStore replacement = ca.issue("replacement", now - MINUTE, now + 2 * HOUR);
+
+        for (KeyStore candidate : List.of(original, replacement)) {
+            Issuer issuer = new Issuer(() -> original, () -> original, () -> original, failure(), () -> {
+                Thread.currentThread().interrupt();
+
+                return candidate;
+            });
+            SslContextProvider p = new SslContextProvider(issuer);
+
+            p.reload();
+            assertNull(p.renew(p.context()));
+            GridTestUtils.assertThrows(log, p::reload, IgniteException.class, ISSUER_DOWN);
+
+            SSLContext inUse = p.context();
+            X509Certificate[] chain = p.certificateChain();
+            SslContextProvider.ReloadOutcome outcome = p.reloadOutcome();
+            int failures = p.renewalFailures();
+
+            assertTrue(outcome.successTime() > 0);
+            assertEquals(1, outcome.failures());
+            assertEquals(1, failures);
+
+            IgniteInterruptedCheckedException err = null;
+            boolean interrupted;
+
+            try {
+                p.renew(inUse);
+            }
+            catch (IgniteInterruptedCheckedException e) {
+                err = e;
+            }
+            finally {
+                interrupted = Thread.interrupted();
+            }
+
+            assertTrue(interrupted);
+            assertSame(inUse, p.context());
+            assertArrayEquals(chain, p.certificateChain());
+            assertEquals(outcome, p.reloadOutcome());
+            assertEquals(failures, p.renewalFailures());
+            assertNotNull(err);
+        }
     }
 
     /** Cached and expired unchanged chains stay in use and count as unsuccessful renewal attempts. */
