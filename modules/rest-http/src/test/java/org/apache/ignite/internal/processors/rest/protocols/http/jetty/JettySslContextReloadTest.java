@@ -132,7 +132,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     }
 
     /**
-     * New HTTP REST connections use the renewed certificate without resuming old TLS sessions. Existing connections stay open,
+     * New HTTP REST connections use the reloaded certificate without resuming old TLS sessions. Existing connections stay open,
      * and clients without certificates can connect when client authentication is disabled. A failed reload keeps the last
      * working context.
      */
