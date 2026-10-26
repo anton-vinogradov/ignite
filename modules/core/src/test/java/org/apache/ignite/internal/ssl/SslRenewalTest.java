@@ -912,6 +912,24 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertRenewalRejected(p, "The new key material has no private key, so the node would present no certificate");
     }
 
+    /** With renewal disabled, missing certificate metadata must not schedule renewal or produce renewal log messages. */
+    @Test
+    public void testUnknownCertificateWithoutRenewal() throws Exception {
+        Issuer issuer = new Issuer(this::twoKeys);
+
+        issuer.setRenewalEnabled(false);
+
+        IgniteEx g = startClientConnectorOn(issuer);
+
+        SslContextProvider p = provider(g, CLIENT_CONNECTOR);
+
+        assertNull(p.certificateChain());
+        assertEquals(0, p.nextRenewalTime());
+        assertContains(log, status(g), "certificate metadata is unavailable");
+        assertContains(log, reload(g), ": reloaded " + CLIENT_CONNECTOR);
+        assertTrue(appender.events().isEmpty());
+    }
+
     /** Renewal settings are fixed at registration; changing the factory must not let reload lose the chain used by renewal. */
     @Test
     public void testReloadCannotLoseMetadataWithRenewal() {
