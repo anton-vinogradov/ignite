@@ -62,7 +62,7 @@ tab:C#/.NET[]
 tab:C++[unsupported]
 --
 
-The keystore must contain the node's certificate and private key.
+The keystore must contain the node's certificate and private key. For automatic renewal, keep exactly one private key and its X.509 chain in each store.
 
 The trust store defines which peer certificates the node accepts. Configure trust on all nodes and clients before replacing certificates.
 
@@ -163,6 +163,7 @@ include::{javaFile}[tag=disable-validation,indent=0]
 == Reload or Restart
 
 Use link:tools/control-script#reloading-certificates[`control.sh --ssl reload`] after manually replacing a node's certificate or trust store.
+For automatically delivered certificates, see <<Renewing Certificates Automatically>>.
 
 [cols="2,3",opts="header"]
 |===
