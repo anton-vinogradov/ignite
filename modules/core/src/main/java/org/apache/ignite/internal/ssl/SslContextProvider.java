@@ -125,6 +125,13 @@ public class SslContextProvider {
         if (renewBeforeFraction == 0)
             return;
 
+        try {
+            checkKeyMaterial(bundle.certificateChains());
+        }
+        catch (IgniteCheckedException e) {
+            throw new IgniteException(e.getMessage(), e);
+        }
+
         if (renewalChain(bundle) == null) {
             throw new IgniteException("The SSL context factory must provide a nonempty certificate chain for every private key " +
                 "to renew automatically [transports=" + transports() + ']');
@@ -136,7 +143,7 @@ public class SslContextProvider {
 
     /**
      * Builds and installs a new context for new connections, recording success or failure. Rejects key material known to have no
-     * private key. If a certificate chain is supplied, every certificate must be within its validity period.
+     * private key or a key without an X.509 certificate chain. If a certificate chain is supplied, every certificate must be within its validity period.
      * Certificate metadata is required when automatic renewal is enabled.
      * The administrator must ensure that peers trust the new certificates and can connect with the new context.
      *
@@ -242,7 +249,7 @@ public class SslContextProvider {
      * Chooses the first chain to expire, using the earliest leaf validity start to break ties.
      *
      * @param bundle Context and its chains.
-     * @return Chain that determines renewal, or {@code null} unless every private key has a known, nonempty chain.
+     * @return Chain that determines renewal, or {@code null} unless every private key has a nonempty X.509 chain.
      */
     static @Nullable List<X509Certificate> renewalChain(SslBundle bundle) {
         Map<String, List<X509Certificate>> chains = bundle.certificateChains();
@@ -271,18 +278,35 @@ public class SslContextProvider {
 
     /**
      * @return Bundle built anew, or the context in use if a custom factory caches it.
-     * @throws IgniteCheckedException If the loaded material is known to have no private key.
+     * @throws IgniteCheckedException If the loaded material has no private key or a key has no X.509 certificate chain.
      */
     private SslBundle build() throws IgniteCheckedException {
         SslBundle rebuilt = createBundle();
-        Map<String, List<X509Certificate>> chains = rebuilt.certificateChains();
 
-        if (chains != null && chains.isEmpty())
-            throw new IgniteCheckedException("The new key material has no private key, so the node would present no certificate");
+        checkKeyMaterial(rebuilt.certificateChains());
 
         rebuilt.context().createSSLEngine();
 
         return rebuilt;
+    }
+
+    /**
+     * @param chains Chains by private-key alias, {@code null} if the factory supplies no metadata.
+     * @throws IgniteCheckedException If there is no private key or a key has no X.509 certificate chain.
+     */
+    private static void checkKeyMaterial(@Nullable Map<String, List<X509Certificate>> chains) throws IgniteCheckedException {
+        if (chains == null)
+            return;
+
+        if (chains.isEmpty())
+            throw new IgniteCheckedException("The new key material has no private key, so the node would present no certificate");
+
+        for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
+            if (entry.getValue().isEmpty()) {
+                throw new IgniteCheckedException("The private key has no X.509 certificate chain; remove the key or provide its " +
+                    "X.509 certificate chain [alias=" + entry.getKey() + ']');
+            }
+        }
     }
 
     /**
