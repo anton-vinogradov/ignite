@@ -255,11 +255,13 @@ For manual file replacement, use <<Upgrading Certificates>> and run reload after
 === Prepare Certificate Delivery
 
 The delivery system must make a valid replacement available before renewal is due. Ignite reads the files when renewal is due, not when they change.
+
 Renewal follows the first certificate to expire across all private-key chains, including CA certificates. If several chains expire together, the earliest renewal window applies.
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
 With `SslContextFactory`, include the X.509 chain of every private key in the key store. A custom factory must supply all these chains with each context.
 Without complete chains, a node with automatic renewal enabled cannot start because it cannot determine when renewal is due.
+
 Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
 
 Nodes and applications must trust the replacement certificates before they are loaded. For a new CA, follow the stages in <<Upgrading Certificates>>.
@@ -350,6 +352,7 @@ It builds the key managers and metadata from that store.
 
 If you build the context yourself, return it and its chains in an `SslBundle`.
 Use `null` for unavailable metadata. An empty map reports that there are no private keys, so node reload rejects it.
+
 With automatic renewal enabled, every private key must have a nonempty chain at startup and on each reload. Without renewal, metadata is optional.
 See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html#createSslBundle()[method contract] for call ordering, concurrent calls and remote request handling.
 
