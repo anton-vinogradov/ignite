@@ -83,6 +83,7 @@ import org.apache.ignite.ssl.MultipleSSLContextsTest;
 import org.apache.ignite.ssl.SSLContextWrapperTest;
 import org.apache.ignite.ssl.SslContextMetadataTest;
 import org.apache.ignite.ssl.SslContextReloadTest;
+import org.apache.ignite.ssl.SslContextReuseTest;
 import org.apache.ignite.tools.junit.JUnitTeamcityReporter;
 import org.junit.BeforeClass;
 import org.junit.runner.RunWith;
@@ -149,6 +150,7 @@ import org.junit.runners.Suite;
     SslContextMetadataTest.class,
     SslContextProviderTest.class,
     SslContextReloadTest.class,
+    SslContextReuseTest.class,
     MaintenanceModeNodeSecurityTest.class,
     ServiceAuthorizationTest.class,
     ServiceStaticConfigTest.class,
