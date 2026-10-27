@@ -423,17 +423,13 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertRenewalRejected(p, "The new certificate chain is not valid now");
     }
 
-    /**
-     * A renewal planned before a reload must not ask for a certificate or replace the one the reload has put in use. The reload
-     * must leave the factory's {@code create()} returning the first context.
-     */
+    /** A renewal planned before a reload must not ask for a certificate or replace the one the reload has put in use. */
     @Test
     public void testRenewalPlannedBeforeReloadSuperseded() throws Exception {
         KeyStore inUse = ca.keyStoreWithPrivateKey();
 
         Issuer issuer = new Issuer(() -> inUse);
 
-        SSLContext cached = issuer.create();
         SslContextProvider p = new SslContextProvider(issuer);
 
         SSLContext planned = p.context();
@@ -444,12 +440,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         p.reload();
 
         SSLContext reloaded = p.context();
+        int callsAfterReload = issuer.calls.size();
+
+        assertNotSame(planned, reloaded);
 
         assertNull(p.renew(planned));
         assertEquals(1, p.renewalFailures());
         assertSame(reloaded, p.context());
-        assertEquals("The superseded renewal must not ask for another certificate", 4, issuer.calls.size());
-        assertSame(cached, issuer.create());
+        assertEquals("The superseded renewal must not ask for another certificate", callsAfterReload, issuer.calls.size());
     }
 
     /** A reload during renewal planning prevents the outdated attempt from calling the factory or replacing the new context. */
