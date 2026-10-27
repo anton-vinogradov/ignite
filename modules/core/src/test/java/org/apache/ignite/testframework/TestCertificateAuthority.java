@@ -17,7 +17,10 @@
 
 package org.apache.ignite.testframework;
 
+import java.io.OutputStream;
 import java.math.BigInteger;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
@@ -30,9 +33,14 @@ import java.util.Date;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.security.auth.x500.X500Principal;
+import org.apache.ignite.ssl.KeyMaterial;
+import org.apache.ignite.ssl.SslBundle;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
 import org.bouncycastle.asn1.x509.Extension;
@@ -45,7 +53,7 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 /**
  * Issues JKS stores protected by {@link #PWD}, each with an EC P-256 private key and its certificate chain.
  * Certificates use SHA256withECDSA signatures. Issued leaf certificates allow both server and client authentication,
- * so the same material works for node-to-node TLS.
+ * so the same material works for node-to-node TLS. Tests choose the issuer and validity dates when those are part of the scenario.
  */
 public class TestCertificateAuthority {
     /** Password of every store made here. */
@@ -72,12 +80,19 @@ public class TestCertificateAuthority {
      * @param cn Common name of the authority.
      */
     public TestCertificateAuthority(String cn) throws Exception {
-        long now = System.currentTimeMillis();
+        this(cn, System.currentTimeMillis() - TimeUnit.DAYS.toMillis(1), System.currentTimeMillis() + TimeUnit.DAYS.toMillis(365));
+    }
 
+    /**
+     * @param cn Common name of the authority.
+     * @param notBefore Time the authority's certificate becomes valid; rounded down to a second.
+     * @param notAfter Time the authority's certificate expires; rounded down to a second.
+     */
+    public TestCertificateAuthority(String cn, long notBefore, long notAfter) throws Exception {
         name = new X500Principal("CN=" + cn);
         keys = keyPair();
 
-        cert = sign(name, keys, now - TimeUnit.DAYS.toMillis(1), now + TimeUnit.DAYS.toMillis(365), true);
+        cert = sign(name, keys, notBefore, notAfter, true);
     }
 
     /** @return Store with one private key and a currently valid certificate whose name is irrelevant to the test. */
@@ -93,10 +108,29 @@ public class TestCertificateAuthority {
      */
     public KeyStore keyStoreWithPrivateKey(String cn) throws Exception {
         long now = System.currentTimeMillis();
+
+        return keyStoreWithPrivateKey(cn, now - TimeUnit.HOURS.toMillis(1), now + TimeUnit.DAYS.toMillis(1));
+    }
+
+    /**
+     * @param notBefore Time the certificate becomes valid; rounded down to a second.
+     * @param notAfter Time it expires; rounded down to a second.
+     * @return Store with one private key and a certificate with the requested validity dates whose name is irrelevant to the test.
+     */
+    public KeyStore keyStoreWithPrivateKey(long notBefore, long notAfter) throws Exception {
+        return keyStoreWithPrivateKey(DEFAULT_NAME, notBefore, notAfter);
+    }
+
+    /**
+     * @param cn Common name of the certificate, also used as the key alias.
+     * @param notBefore Time it becomes valid; rounded down to a second.
+     * @param notAfter Time it expires; rounded down to a second.
+     * @return Key store with the private key and a chain containing the issued certificate and this authority's certificate.
+     */
+    public KeyStore keyStoreWithPrivateKey(String cn, long notBefore, long notAfter) throws Exception {
         KeyPair pair = keyPair();
 
-        X509Certificate leaf = sign(new X500Principal("CN=" + cn), pair, now - TimeUnit.HOURS.toMillis(1),
-            now + TimeUnit.DAYS.toMillis(1), false);
+        X509Certificate leaf = sign(new X500Principal("CN=" + cn), pair, notBefore, notAfter, false);
 
         KeyStore store = emptyStore();
 
@@ -107,11 +141,37 @@ public class TestCertificateAuthority {
 
     /** @return Trust store with this authority alone. */
     public KeyStore trustStore() throws Exception {
+        return trustStore(this);
+    }
+
+    /**
+     * @param authorities Authorities to trust.
+     * @return Trust store with them.
+     */
+    public static KeyStore trustStore(TestCertificateAuthority... authorities) throws Exception {
         KeyStore store = emptyStore();
 
-        store.setCertificateEntry(name.getName(), cert);
+        for (TestCertificateAuthority a : authorities)
+            store.setCertificateEntry(a.name.getName(), a.cert);
 
         return store;
+    }
+
+    /**
+     * @param stores Stores issued here, with distinct aliases.
+     * @return Store with the private keys and chains of all of them.
+     */
+    public static KeyStore merged(KeyStore... stores) throws Exception {
+        KeyStore res = emptyStore();
+
+        for (KeyStore store : stores) {
+            for (String alias : Collections.list(store.aliases())) {
+                if (store.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class))
+                    res.setKeyEntry(alias, store.getKey(alias, PWD), PWD, store.getCertificateChain(alias));
+            }
+        }
+
+        return res;
     }
 
     /**
@@ -145,6 +205,33 @@ public class TestCertificateAuthority {
     }
 
     /**
+     * @param keyStore Store with the certificate to present.
+     * @param trustStore Store with the authorities to trust.
+     * @return Context using the supplied key and trust stores.
+     */
+    public static SSLContext context(KeyStore keyStore, KeyStore trustStore) throws Exception {
+        SSLContext ctx = SSLContext.getInstance("TLS");
+
+        ctx.init(keyManagers(keyStore), trustManagers(trustStore), null);
+
+        return ctx;
+    }
+
+    /**
+     * @param keyStore Store with the certificates to present.
+     * @param trustStore Store with the authorities to trust.
+     * @return Context and certificate chains from the supplied stores.
+     */
+    public static SslBundle bundle(KeyStore keyStore, KeyStore trustStore) throws Exception {
+        KeyMaterial material = new KeyMaterial(keyStore, PWD, KeyManagerFactory.getDefaultAlgorithm());
+        SSLContext ctx = SSLContext.getInstance("TLS");
+
+        ctx.init(material.keyManagers(), trustManagers(trustStore), null);
+
+        return new SslBundle(ctx, material.certificateChains());
+    }
+
+    /**
      * @param trustStore Store with the authorities to trust.
      * @return Trust managers that trust them.
      */
@@ -154,6 +241,28 @@ public class TestCertificateAuthority {
         tmf.init(trustStore);
 
         return tmf.getTrustManagers();
+    }
+
+    /**
+     * @param store Store.
+     * @param path File to write or replace.
+     */
+    public static void save(KeyStore store, Path path) throws Exception {
+        try (OutputStream out = Files.newOutputStream(path)) {
+            store.store(out, PWD);
+        }
+    }
+
+    /**
+     * @param keyStore Store with the certificate to present.
+     * @return Key managers that present it.
+     */
+    private static KeyManager[] keyManagers(KeyStore keyStore) throws Exception {
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+
+        kmf.init(keyStore, PWD);
+
+        return kmf.getKeyManagers();
     }
 
     /**
