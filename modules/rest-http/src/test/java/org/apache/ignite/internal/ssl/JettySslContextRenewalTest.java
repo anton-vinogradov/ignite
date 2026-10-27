@@ -71,8 +71,8 @@ public class JettySslContextRenewalTest extends GridCommonAbstractTest {
         long timeLeft = MINUTES.toMillis(5);
         long renewalWindow = 2 * timeLeft;
         long initExpiry = now + timeLeft;
-        KeyStore initKeys = ca.issue(initExpiry - lifetime, initExpiry);
-        KeyStore renewed = ca.issue(now, now + lifetime);
+        KeyStore initKeys = ca.keyStoreWithPrivateKey(initExpiry - lifetime, initExpiry);
+        KeyStore renewed = ca.keyStoreWithPrivateKey(now, now + lifetime);
         X509Certificate replacement = certificateChain(renewed)[0];
         KeyStore trust = ca.trustStore();
         CountDownLatch replacementReady = new CountDownLatch(1);
