@@ -33,6 +33,7 @@ import org.apache.ignite.IgniteException;
 import org.apache.ignite.configuration.ConnectorConfiguration;
 import org.apache.ignite.configuration.IgniteConfiguration;
 import org.apache.ignite.internal.IgniteEx;
+import org.apache.ignite.ssl.SslBundle;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
@@ -71,26 +72,23 @@ public class JettySslContextRenewalTest extends GridCommonAbstractTest {
         long timeLeft = MINUTES.toMillis(5);
         long renewalWindow = 2 * timeLeft;
         long initExpiry = now + timeLeft;
-        KeyStore initKeys = ca.keyStoreWithPrivateKey(initExpiry - lifetime, initExpiry);
-        KeyStore renewed = ca.keyStoreWithPrivateKey(now, now + lifetime);
+        String keyAlias = "https-key";
+        KeyStore initKeys = ca.keyStoreWithPrivateKey(keyAlias, initExpiry - lifetime, initExpiry);
+        KeyStore renewed = ca.keyStoreWithPrivateKey(keyAlias, now, now + lifetime);
         X509Certificate replacement = certificateChain(renewed)[0];
         KeyStore trust = ca.trustStore();
         CountDownLatch replacementReady = new CountDownLatch(1);
         AtomicBoolean first = new AtomicBoolean(true);
 
         factory = new SslContextFactory() {
-            @Override public SSLContext create() {
-                return createNew();
-            }
-
-            @Override public SSLContext createNew() {
+            @Override public SslBundle createSslBundle() {
                 boolean initLoad = first.getAndSet(false);
 
                 try {
                     if (!initLoad)
                         replacementReady.await();
 
-                    return TestCertificateAuthority.context(initLoad ? initKeys : renewed, trust);
+                    return TestCertificateAuthority.bundle(initLoad ? initKeys : renewed, trust);
                 }
                 catch (Exception e) {
                     throw new IgniteException(e);
@@ -114,13 +112,13 @@ public class JettySslContextRenewalTest extends GridCommonAbstractTest {
             replacementReady.countDown();
 
             assertTrue("HTTP REST must renew automatically",
-                waitForCondition(() -> replacement.equals(provider.certificate()), 10_000));
+                waitForCondition(() -> replacement.equals(provider.certificateChains().get(keyAlias).get(0)), 10_000));
 
             X509Certificate[] after = probe(port, trust);
 
             assertEquals(replacement, after[0]);
             assertTrue("The chain served over HTTPS must expire later",
-                SslCertificates.chainNotAfter(after) > SslCertificates.chainNotAfter(before));
+                SslCertificates.chainNotAfter(Arrays.asList(after)) > SslCertificates.chainNotAfter(Arrays.asList(before)));
         }
         finally {
             replacementReady.countDown();
