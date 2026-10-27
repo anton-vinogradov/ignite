@@ -51,6 +51,8 @@ import org.apache.ignite.internal.util.typedef.internal.U;
 import org.apache.ignite.internal.visor.VisorTaskArgument;
 import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
 import org.apache.ignite.spi.communication.tcp.internal.ConnectionClientPool;
+import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi;
+import org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder;
 import org.apache.ignite.testframework.GridTestNode;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.ListeningTestLogger;
@@ -125,12 +127,17 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
     /** Trust store every node starts on, unless one is placed for it. */
     private KeyStore initTrustStore;
 
+    /** Discovery addresses shared only by nodes in this test. */
+    private TcpDiscoveryVmIpFinder ipFinder;
+
     /** */
     private final ListeningTestLogger nodeLog = new ListeningTestLogger(log);
 
     /** {@inheritDoc} */
     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
         IgniteConfiguration cfg = super.getConfiguration(igniteInstanceName).setGridLogger(nodeLog);
+
+        ((TcpDiscoverySpi)cfg.getDiscoverySpi()).setIpFinder(ipFinder);
 
         if (!Files.exists(keyStore(igniteInstanceName)))
             TestCertificateAuthority.save(oldKeys, keyStore(igniteInstanceName));
@@ -149,6 +156,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
     /** {@inheritDoc} */
     @Override protected void beforeTest() throws Exception {
+        ipFinder = new TcpDiscoveryVmIpFinder(true);
         dir = Files.createTempDirectory("ignite-ssl-reload-");
         now = System.currentTimeMillis();
         oldCa = new TestCertificateAuthority("old-ca");
