@@ -74,20 +74,21 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
     /** An existing create override still controls the context, including its cache. Reload must not silently bypass it. */
     @Test
-    public void testLegacyCreateOverrideIsPreserved() {
+    public void testLegacyCreateOverrideIsPreserved() throws Exception {
+        SSLContext cached = TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
+
         ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey) {
             @Override public SSLContext create() {
-                return super.create();
+                return cached;
             }
         };
-        SSLContext cached = factory.create();
         SslContextProvider provider = new SslContextProvider(factory);
 
         assertSame(cached, provider.context());
         assertNull(provider.certificateChains());
         GridTestUtils.assertThrows(log, provider::reload, IgniteCheckedException.class, "returns the context in use");
         assertSame(cached, provider.context());
-        assertEquals(1, factory.calls);
+        assertEquals(0, factory.calls);
     }
 
     /** An old file-factory subclass may supply its cached context without configuring any store paths. */
