@@ -86,7 +86,7 @@ The following table describes the properties of link:https://ignite.apache.org/r
 |`null`
 
 |`setHttpSslFactory(Factory<SSLContext>)`
-|SSL context factory for HTTPS. Supports certificate reload. See <<HTTPS and Certificate Reload>>.
+|SSL context factory for HTTPS. Supports certificate reload and automatic renewal. See <<HTTPS and Certificate Reload>>.
 |Yes
 |`null`
 
@@ -108,7 +108,7 @@ To enable HTTPS, configure `ConnectorConfiguration.httpSslFactory` with the HTTP
 Ignite applies it to the built-in Jetty connector or the connector in your Jetty XML file.
 To require client certificates, also set `httpSslClientAuth` to `true`.
 
-With this configuration, HTTP REST supports link:tools/control-script#reloading-certificates[`control.sh --ssl reload`] and link:tools/control-script#checking-certificates[`control.sh --ssl status`].
+With this configuration, HTTP REST supports link:tools/control-script#reloading-certificates[`control.sh --ssl reload`], link:tools/control-script#checking-certificates[`control.sh --ssl status`] and link:security/ssl-tls#renewing-certificates-automatically[automatic renewal].
 If your Jetty XML file configures TLS directly, replacing those certificates requires a node restart. You can migrate that configuration using the steps below.
 
 If you keep TLS configured directly in Jetty XML, configure client authentication with `needClientAuth` there. Setting `httpSslClientAuth=true` without `httpSslFactory` prevents the node from starting.
