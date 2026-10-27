@@ -345,31 +345,29 @@ The link:monitoring-metrics/new-metrics#ssl[`ssl.ConsecutiveRenewalFailures`] me
 
 This section is for developers integrating a certificate source, such as a PKI service.
 
-To support reload and automatic renewal with certificate status, extend link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html[AbstractSslContextFactory] and override `createSslBundle()`.
-Return a fresh link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/SslBundle.html[SslBundle] containing the initialized context and the certificate chains loaded with it, indexed by private-key alias.
-Include every private key, even when the context can choose among several keys.
+To support reload and automatic renewal with certificate status, extend link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html[AbstractSslContextFactory].
+Its `createSslBundle()` method builds a fresh link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/SslBundle.html[SslBundle] containing the initialized context and the certificate chains loaded with it, indexed by private-key alias.
+The `create()` method returns `createSslBundle().context()`: each call creates a new context, with no cache in the factory.
 
-If the source provides a key store, pass it with its key password and key manager algorithm to link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/KeyMaterial.html[KeyMaterial], then call the protected `createSslBundle(KeyMaterial)` helper.
-It builds the key managers and metadata from that store.
+If the source provides a key store, override `loadKeyMaterial()` to return link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/KeyMaterial.html[KeyMaterial] containing that loaded store, its key password and key manager algorithm.
+The base factory builds the context and metadata from the same store load.
 
-If you build the context yourself, return it and its chains in an `SslBundle`.
-Use `null` for unavailable metadata. An empty map reports that there are no private keys, so node reload rejects it.
+The bundle includes every private-key alias, even when the context can choose among several keys.
+An empty map reports that there are no private keys, so node reload rejects it.
 
 With automatic renewal enabled, every private key must have a nonempty chain at startup and on each reload. Without renewal, metadata is optional.
 See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html#createSslBundle()[method contract] for call ordering, concurrent calls and remote request handling.
 
 === Migrating an Existing Factory
 
-The deprecated `create()` method keeps its cached context. Existing subclasses can still use it, the protected `sslCtx` cache and the deprecated `createKeyManagers()` hook.
-The new `createSslBundle()` method requires an implementation; it does not adapt the old manager hook.
+The protected `sslCtx` cache and the no-argument `createKeyManagers()` hook have been removed. Update subclasses that use them and recompile before upgrading:
 
-Overriding `createSslBundle()` does not change `create()`.
-If a new factory also needs to serve callers of `Factory.create()`, provide an explicit `create()` adapter or implement the deprecated `createKeyManagers()` hook.
+* Replace `createKeyManagers()` overrides with `loadKeyMaterial()`, returning the loaded store and its settings instead of key managers.
+* If a custom `create()` override loads a store and constructs a context, move that loading into `loadKeyMaterial()` and use the base factory's bundle construction. The inherited `create()` adapter then uses the same implementation as node reload.
+* Move any context caching needed by an external caller into that caller. The node keeps the current bundle and replaces it on reload.
 
-To opt into fresh bundles, override `createSslBundle()`:
+A subclass that only overrides `SslContextFactory.loadKeyStore()` can keep that override; the inherited bundle method uses it.
 
-* If the subclass only changes how `SslContextFactory` loads its store, delegate the override to `super.createSslBundle()`.
-* If it builds its own context in `create()`, build a fresh context from the same source in `createSslBundle()` and return it with its metadata.
-
-A plain `Factory<SSLContext>` can still support manual reload by returning a fresh context on every call. Returning the context already in use makes reload fail.
-This legacy path supplies no metadata: status cannot report certificate dates, and reload cannot validate them.
+If the source provides a ready-made `SSLContext` instead of a key store, use a plain `Factory<SSLContext>`.
+It can support manual reload by returning a fresh context on every call. Returning the context already in use makes reload fail.
+It supplies no metadata: status cannot report certificate dates, and reload cannot validate them.
