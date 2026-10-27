@@ -101,7 +101,9 @@ public class SslContextProvider {
      *
      * @param factory Configured factory.
      * @return Source that preserves the factory's most specific creation method.
+     * @deprecated When the legacy factory cache is removed, use createSslBundle() for every AbstractSslContextFactory.
      */
+    @Deprecated
     private static Supplier<SslBundle> bundleSource(Factory<SSLContext> factory) {
         if (factory.getClass() == SslContextFactory.class)
             return ((SslContextFactory)factory)::createSslBundle;
