@@ -259,7 +259,7 @@ For manual file replacement, use <<Upgrading Certificates>> and run reload after
 === Prepare Certificate Delivery
 
 Renewal follows the first certificate to expire across all private-key chains, including CA certificates.
-For that chain, the renewal window is the fraction `renewBeforeFraction` of the time from its leaf certificate's start date to its earliest expiry. Ignite starts requesting replacements when this window opens; `control.sh --ssl status` shows the next attempt time. If several chains expire together, the earliest window applies.
+For that chain, the renewal window is the last `renewBeforeFraction` share of the time from its leaf certificate's start date to its earliest expiry, so the window ends at that expiry. Ignite starts requesting replacements when this window opens; `control.sh --ssl status` shows the next attempt time. If several chains expire together, the earliest window applies.
 
 The delivery system must make a valid replacement available before the window opens. Ignite reads the files at each scheduled attempt, not when they change.
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.

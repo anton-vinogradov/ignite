@@ -121,7 +121,8 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     /**
      * Sets whether a node calls {@link #createSslBundle()} before the certificates expire to pick up replacements.
      * A file-based factory rereads its files. It does not replace them.
-     * When enabled, the factory must provide a nonempty X.509 chain for every private key or the node does not start. Disabled by default.
+     * When enabled, the factory must provide at least one private key and a nonempty X.509 chain for every private key, or the node
+     * does not start. Disabled by default.
      * Set this before starting the node; changing it on a running node takes effect after a restart.
      *
      * @param renewalEnabled Whether renewal is enabled.
@@ -155,9 +156,9 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * Checks the factory parameters, loads its key material once, and builds a fresh context with the certificate chains from
      * that material. The factory does not retain the result.
      * <p>
-     * The node uses this method at startup, for {@code control.sh --ssl reload} and for automatic renewal. A node serializes its
-     * calls for each factory object. A factory shared by several nodes in one JVM, or also called by application code, must support
-     * concurrent calls. A factory that fetches certificates remotely must bound each request and respond to thread interruption.
+     * The node uses this method at startup, for {@code control.sh --ssl reload} and for automatic renewal. A node never calls this
+     * method concurrently for one factory object. A factory shared by several nodes in one JVM, or also used by application code,
+     * must be thread-safe. A factory that fetches certificates remotely must bound each request and respond to thread interruption.
      *
      * @return Fresh context and the certificate metadata available to this factory.
      * @throws IgniteException If the context could not be created.
