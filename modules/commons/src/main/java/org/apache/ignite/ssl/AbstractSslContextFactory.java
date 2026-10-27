@@ -27,7 +27,6 @@ import javax.net.ssl.SSLParameters;
 import javax.net.ssl.TrustManager;
 import org.apache.ignite.IgniteException;
 import org.apache.ignite.internal.util.typedef.internal.A;
-import org.jetbrains.annotations.Nullable;
 
 /**
  * Builds a fresh SSL context and its certificate metadata on each call. The component using the context is responsible for
@@ -156,9 +155,9 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * Checks the factory parameters, loads its key material once, and builds a fresh context with the certificate chains from
      * that material. The factory does not retain the result.
      * <p>
-     * The node uses this method at startup, for {@code control.sh --ssl reload} and for automatic renewal. Calls for the same
-     * factory on a node never overlap. A factory that fetches certificates remotely must bound each request and respond to
-     * thread interruption.
+     * The node uses this method at startup, for {@code control.sh --ssl reload} and for automatic renewal. A node serializes its
+     * calls for each factory object. A factory shared by several nodes in one JVM, or also called by application code, must support
+     * concurrent calls. A factory that fetches certificates remotely must bound each request and respond to thread interruption.
      *
      * @return Fresh context and the certificate metadata available to this factory.
      * @throws IgniteException If the context could not be created.
@@ -169,7 +168,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
 
             KeyMaterial material = loadKeyMaterial();
 
-            return new SslBundle(createSslContext(material.keyManagers()), material.certificateChains());
+            return new SslBundle(createSslContext(createKeyManagers(material)), material.certificateChains());
         }
         catch (SSLException e) {
             throw new IgniteException(e);
@@ -177,11 +176,13 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     }
 
     /**
-     * @param keyMgrs Key managers, or {@code null} to use the provider's defaults.
+     * @param keyMgrs Key managers for the loaded material.
      * @return Initialized context.
      * @throws SSLException If trust managers or the context cannot be created.
      */
-    private SSLContext createSslContext(@Nullable KeyManager[] keyMgrs) throws SSLException {
+    private SSLContext createSslContext(KeyManager[] keyMgrs) throws SSLException {
+        checkNullParameter(keyMgrs, "keyManagers");
+
         TrustManager[] trustMgrs = createTrustManagers();
 
         try {
@@ -230,11 +231,23 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
 
     /**
      * Loads the key store and the settings used to read its keys. Called once per context, after the parameters are checked.
+     * For a context without private keys, return material over an empty store initialized with {@code KeyStore.load(null, null)}.
      *
-     * @return Loaded key material.
+     * @return Loaded key material, never {@code null}.
      * @throws SSLException If the key material cannot be loaded.
      */
     protected abstract KeyMaterial loadKeyMaterial() throws SSLException;
+
+    /**
+     * Creates key managers from the loaded material. Override to customize key selection without reloading the store.
+     *
+     * @param material Loaded key material whose certificate chains will be included in the bundle.
+     * @return Key managers using that material, never {@code null}.
+     * @throws SSLException If the key managers cannot be created.
+     */
+    protected KeyManager[] createKeyManagers(KeyMaterial material) throws SSLException {
+        return material.keyManagers();
+    }
 
     /**
      * @return Created Trust Managers.
@@ -243,12 +256,12 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     protected abstract TrustManager[] createTrustManagers() throws SSLException;
 
     /**
-     * Builds a fresh context through {@link #createSslBundle()}.
+     * Builds a fresh context through {@link #createSslBundle()}. Override that method to customize both entry points.
      *
      * @return Fresh initialized context.
      * @throws IgniteException If the context could not be created.
      */
-    @Override public SSLContext create() {
+    @Override public final SSLContext create() {
         return createSslBundle().context();
     }
 }

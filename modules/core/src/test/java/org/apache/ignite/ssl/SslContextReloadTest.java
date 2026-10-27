@@ -25,6 +25,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.SSLContext;
@@ -386,6 +387,45 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         assertEquals(certificateChain(nextKeys)[0], certificateAt(g.context().clientListener().port()));
     }
 
+    /** A factory linkage failure is audited and does not prevent reloading the remaining factories on the node. */
+    @Test
+    public void testLinkageErrorDoesNotSkipRemainingFactory() throws Exception {
+        String failureReason = "Certificate provider class is unavailable";
+        AtomicBoolean fail = new AtomicBoolean();
+        TestFactory nodeFactory = new TestFactory() {
+            @Override public SSLContext create() {
+                if (fail.get())
+                    throw new NoClassDefFoundError(failureReason);
+
+                return super.create();
+            }
+        };
+        TestFactory clientFactory = new TestFactory();
+        IgniteEx g = startGrid(0, cfg -> {
+            cfg.setSslContextFactory(nodeFactory);
+            cfg.getClientConnectorConfiguration().setUseIgniteSslContextFactory(false).setSslContextFactory(clientFactory);
+        });
+
+        assertEquals(COMMUNICATION + ", " + DISCOVERY, g.context().sslContexts().providers().iterator().next().transports());
+
+        LogListener audited = LogListener.matches(msg -> msg.startsWith("Failed to reload TLS certificates") &&
+            msg.contains("initiator=management command, originNodeId=" + g.localNode().id()) &&
+            msg.contains("reason=" + failureReason)).build();
+
+        nodeLog.registerListener(audited);
+        placeKeys(newKeys);
+        fail.set(true);
+
+        String res = reloadFailure(g);
+
+        assertFailed(res, g, COMMUNICATION + ", " + DISCOVERY);
+        assertContains(log, res, failureReason);
+        assertReloaded(res, g, CLIENT_CONNECTOR);
+        assertEquals(oldCert, certificateAt(discoveryPort(g)));
+        assertEquals(newCert, certificateAt(g.context().clientListener().port()));
+        assertTrue(audited.check());
+    }
+
     /** An expired certificate stays out of use, and the report, log and status identify the rejected chain. */
     @Test
     public void testExpiredCertificateNotApplied() throws Exception {
@@ -605,7 +645,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
     public void testExpiredCertificateWarnedAtStart() throws Exception {
         TestCertificateAuthority.save(expiredKeys(), keyStore(getTestIgniteInstanceName(0)));
 
-        LogListener expired = LogListener.matches("The TLS certificate chain in use is not valid now").build();
+        LogListener expired = LogListener.matches("The TLS certificate chain in use is not valid now; put a valid certificate").build();
 
         nodeLog.registerListener(expired);
 
