@@ -71,7 +71,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         stopAllGrids();
     }
 
-    /** The node retains a bundle until reload and gets metadata even when the factory overrides only its store loader. */
+    /** The node retains a bundle until reload and uses metadata from the factory's store loader. */
     @Test
     public void testNodeKeepsBundleUntilReload() throws Exception {
         ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey) {
