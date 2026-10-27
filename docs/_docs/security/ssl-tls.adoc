@@ -363,6 +363,9 @@ See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ign
 The deprecated `create()` method keeps its cached context. Existing subclasses can still use it, the protected `sslCtx` cache and the deprecated `createKeyManagers()` hook.
 The new `createSslBundle()` method requires an implementation; it does not adapt the old manager hook.
 
+Overriding `createSslBundle()` does not change `create()`.
+If a new factory also needs to serve callers of `Factory.create()`, provide an explicit `create()` adapter or implement the deprecated `createKeyManagers()` hook.
+
 To opt into fresh bundles, override `createSslBundle()`:
 
 * If the subclass only changes how `SslContextFactory` loads its store, delegate the override to `super.createSslBundle()`.
