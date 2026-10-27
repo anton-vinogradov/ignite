@@ -83,7 +83,7 @@ public class SslContextRegistry extends GridProcessorAdapter {
             provider = new SslContextProvider(factory);
             provider.addTransport(transport);
             provider.startRenewal(renewalExec, ctx.log(SslRenewal.class));
-            warnIfExpired(provider);
+            warnIfUnusable(provider);
 
             providers.add(provider);
         }
@@ -93,14 +93,28 @@ public class SslContextRegistry extends GridProcessorAdapter {
         return provider.sharedContext();
     }
 
-    /** @param provider Newly registered provider. */
-    private void warnIfExpired(SslContextProvider provider) {
+    /**
+     * Warns about key material the node starts with but reload would reject.
+     *
+     * @param provider Newly registered provider.
+     */
+    private void warnIfUnusable(SslContextProvider provider) {
         Map<String, List<X509Certificate>> chains = provider.certificateChains();
 
         if (chains == null)
             return;
 
+        if (chains.isEmpty())
+            U.warn(log, "The key material has no private key, so the node presents no certificate; reload rejects such key material");
+
         for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
+            if (entry.getValue().isEmpty()) {
+                U.warn(log, "The private key has no X.509 certificate chain, so the node never presents it; reload rejects " +
+                    "this key store until the key is removed or its X.509 certificate chain is provided [alias=" + entry.getKey() + ']');
+
+                continue;
+            }
+
             X509Certificate invalid = SslCertificates.invalidAt(entry.getValue(), System.currentTimeMillis());
 
             if (invalid != null) {

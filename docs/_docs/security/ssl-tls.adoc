@@ -184,7 +184,7 @@ Reload checks the dates of the certificate chains supplied by the factory. If an
 
 A custom factory can return a context without certificate information. Status then reports `certificate metadata is unavailable`, and reload cannot check certificate dates.
 
-With `SslContextFactory`, reload also rejects a store with no private keys or a private-key entry without a usable X.509 certificate chain. If there are no private keys, install the node's certificate chain and private key. If the error identifies an alias, add its missing X.509 chain or remove that unusable private-key entry, then run reload again.
+With `SslContextFactory`, reload also rejects a store with no private keys, or with a private key whose certificate chain is missing or contains a non-X.509 certificate. The node never presents such a key. A node can start with one; the node log and `--ssl status` then name its alias, and reload rejects the store until the entry is fixed. If there are no private keys, install the node's certificate chain and private key. If the error names an alias, add the X.509 certificate chain of that key or remove the key, then run reload again.
 
 You must check that peers trust the replacement and that protocols, cipher suites and client authentication settings remain compatible. Reload does not test connections or undo a successful replacement if connections later fail.
 
