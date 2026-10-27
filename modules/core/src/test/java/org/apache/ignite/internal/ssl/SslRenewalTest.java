@@ -17,46 +17,30 @@
 
 package org.apache.ignite.internal.ssl;
 
-import java.io.Serial;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.security.KeyStore;
-import java.security.cert.X509Certificate;
-import java.time.Instant;
-import java.util.Iterator;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.RunnableScheduledFuture;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Collectors;
-import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLException;
-import javax.net.ssl.TrustManager;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.IgniteException;
-import org.apache.ignite.configuration.ClientConnectorConfiguration;
-import org.apache.ignite.internal.IgniteEx;
-import org.apache.ignite.internal.IgniteInternalFuture;
+import org.apache.ignite.IgniteLogger;
 import org.apache.ignite.internal.IgniteInterruptedCheckedException;
+import org.apache.ignite.internal.ssl.SslContextProvider.ReloadOutcome;
 import org.apache.ignite.internal.thread.context.OperationContext;
 import org.apache.ignite.internal.thread.context.OperationContextAttribute;
 import org.apache.ignite.internal.thread.context.Scope;
-import org.apache.ignite.internal.util.typedef.internal.U;
-import org.apache.ignite.spi.metric.IntMetric;
-import org.apache.ignite.spi.metric.Metric;
-import org.apache.ignite.spi.metric.ReadOnlyMetricRegistry;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
-import org.apache.ignite.ssl.KeyMaterial;
 import org.apache.ignite.ssl.SslBundle;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
@@ -65,22 +49,36 @@ import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.core.LogEvent;
-import org.jetbrains.annotations.Nullable;
+import org.junit.Assert;
 import org.junit.Test;
 
-import static org.apache.ignite.internal.ssl.SslContextRegistry.CLIENT_CONNECTOR;
-import static org.apache.ignite.internal.ssl.SslContextRegistry.COMMUNICATION;
-import static org.apache.ignite.internal.ssl.SslContextRegistry.DISCOVERY;
-import static org.apache.ignite.ssl.AbstractSslContextFactory.DFLT_RENEW_BEFORE_FRACTION;
-import static org.apache.ignite.ssl.SslTestUtils.discoveryPort;
-import static org.apache.ignite.ssl.SslTestUtils.reload;
-import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
-import static org.apache.ignite.ssl.SslTestUtils.status;
+import static org.apache.ignite.internal.thread.pool.IgniteScheduledThreadPoolExecutor.newSingleThreadScheduledExecutor;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.GridTestUtils.assertThrowsWithCause;
 import static org.apache.ignite.testframework.GridTestUtils.waitForCondition;
+import static org.apache.ignite.testframework.TestCertificateAuthority.bundle;
+import static org.apache.ignite.testframework.TestCertificateAuthority.chain;
+import static org.apache.ignite.testframework.TestCertificateAuthority.context;
+import static org.apache.ignite.testframework.TestCertificateAuthority.merged;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
-/** Tests that a node renews the certificates of a factory with renewal enabled before they expire. */
+/**
+ * Renewal without nodes: its settings, {@link SslContextProvider#renew(SSLContext)}, the count of unsuccessful renewals and the
+ * scheduler. Renewal is off by default. renew installs all new chains, an expired certificate included, only if the earliest
+ * expiry advances and the checks of reload pass; it refuses a cached context with new metadata, waits on the chains in use,
+ * ignores a replaced context and changes nothing when interrupted. Reload keeps the metadata renewal needs, renewal needs chains
+ * to start, and unsuccessful renewals count until the earliest expiry advances, by renewal or reload. The scheduler tries first
+ * at the window of the earliest chain, then no sooner than a minute after a success, backs off on failures and logs each one,
+ * replans on reload, drops an outdated attempt and runs without the operator context. The log names the installed certificate,
+ * sets the level of a failure by the time left and reports a wait once per lateness, again on expiry. Tests enable renewal on
+ * a factory mock and script its bundles; pauses are the production ones, a minute to an hour. Renewal plans and attempts in
+ * tasks of an executor that records them with their delays and runs one only when a test calls {@code runNext()}. Only two
+ * tests wait: the operator context test runs on the executor of a node and waits for its attempt, and the last test waits for
+ * a certificate to expire. An appender on the logger of {@link SslRenewal} captures what renewal logs.
+ */
 public class SslRenewalTest extends GridCommonAbstractTest {
     /** */
     private static final long SECOND = 1_000L;
@@ -91,1596 +89,813 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     /** */
     private static final long HOUR = 60 * MINUTE;
 
-    /** Tolerance in milliseconds for differences in clock precision when checking scheduled times. */
-    private static final long CLOCK_SLACK = 50;
+    /** Renewal window of a quarter of the lifetime: the last 30 minutes of a certificate that lives 2 hours. */
+    private static final double QUARTER = 0.25;
 
-    /** Failure of an issuer that cannot be reached. */
+    /** Failure of a factory whose issuer cannot be reached. */
     private static final String ISSUER_DOWN = "Issuer is unavailable";
 
-    /** What the node logs while the factory returns the certificates in use. */
+    /** How renewal logs a failed attempt, before the expiry state. */
+    private static final String FAILED = "Failed to reload TLS certificates, the ones in use stay";
+
+    /** How renewal logs an attempt that got the chains in use, before the expiry state. */
     private static final String WAITING = "The SSL context factory has no newer TLS certificates yet, the ones in use stay";
 
-    /** Transports that share the node-wide SSL context, as the log lists them. */
-    private static final String NODE_TRANSPORTS = "transports=communication, discovery";
-
-    /** Operation context attribute standing for whoever runs a reload. */
+    /** Operation context attribute standing for an operator. */
     private static final OperationContextAttribute<String> OPERATOR = OperationContextAttribute.newInstance();
 
-    /** Default certificate authority for the tests. */
+    /** Authority of the test certificates. */
     private TestCertificateAuthority ca;
 
-    /** What the renewals log, with the levels. */
+    /** Logger renewal writes to; {@link #appender} captures it. */
+    private IgniteLogger renewalLog;
+
+    /** What renewal logs, with levels. */
     private final MemorizingAppender appender = new MemorizingAppender();
 
     /** {@inheritDoc} */
     @Override protected void beforeTest() throws Exception {
-        ca = new TestCertificateAuthority("renewalca");
+        ca = new TestCertificateAuthority("renewal-ca");
+        renewalLog = log.getLogger(SslRenewal.class);
 
         appender.start();
         appender.installSelfOn(SslRenewal.class);
-
-        pauses(100, 1_000);
     }
 
     /** {@inheritDoc} */
     @Override protected void afterTest() {
-        try {
-            stopAllGrids();
-        }
-        finally {
-            appender.removeSelfFrom(SslRenewal.class);
-            appender.stop();
-
-            pauses(MINUTE, HOUR);
-        }
+        appender.removeSelfFrom(SslRenewal.class);
+        appender.stop();
     }
 
-    /** Renewal starts within its window, serves the new certificate, schedules its next renewal and stops with the node. */
+    /** Renewal is off by default, and its window must be a share of the lifetime greater than 0 and less than 1. */
     @Test
-    public void testRenewsBeforeExpiry() throws Exception {
+    public void testInvalidSettingsRefused() {
+        SslContextFactory factory = new SslContextFactory();
+
+        assertFalse(factory.isRenewalEnabled());
+        assertThrowsWithCause(() -> factory.setRenewBeforeFraction(0), IllegalArgumentException.class);
+        assertThrowsWithCause(() -> factory.setRenewBeforeFraction(1), IllegalArgumentException.class);
+    }
+
+    /** renew installs all new chains together; their aliases need not match the ones in use. */
+    @Test
+    public void testRenewInstallsAllNewChains() throws Exception {
         long now = System.currentTimeMillis();
-        long renewalDelay = 5 * SECOND;
-        long lifetime = 5 * MINUTE;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        AtomicLong due = new AtomicLong();
+        KeyStore old1 = ca.keyStoreWithPrivateKey("old-1", now - HOUR, now + HOUR);
+        KeyStore old2 = ca.keyStoreWithPrivateKey("old-2", now - HOUR, now + HOUR);
+        KeyStore new1 = ca.keyStoreWithPrivateKey("new-1", now - HOUR, now + 2 * HOUR);
+        KeyStore new2 = ca.keyStoreWithPrivateKey("new-2", now - HOUR, now + 2 * HOUR);
+        SslBundle renewed = bundle(merged(new1, new2), ca.trustStore());
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
 
-        Issuer issuer = new Issuer(() -> {
-            long issued = System.currentTimeMillis();
+        when(f.createSslBundle()).thenReturn(bundle(merged(old1, old2), ca.trustStore()), renewed);
 
-            // Match certificate timestamp precision while keeping the renewal window ahead of this first load.
-            long notAfter = (issued + renewalDelay + window) / SECOND * SECOND;
-            long notBefore = notAfter - lifetime;
+        SslContextProvider p = new SslContextProvider(f);
 
-            due.set(notAfter - window);
+        p.renew(p.context());
 
-            return ca.keyStoreWithPrivateKey(notBefore, notAfter);
-        }, fresh(HOUR));
-
-        IgniteEx g = startNode(issuer);
-
-        assertTrue(waitForCondition(() -> automaticRenewals("transports=" + COMMUNICATION) == 1, 30_000));
-
-        assertTrue("The certificate must have been renewed", chainNotAfter(g) > now + 30 * MINUTE);
-        assertTrue("The renewal must not come before the window opens",
-            issuer.calls.get(1).time >= due.get() - CLOCK_SLACK);
-        assertEquals("New connections must get the renewed certificate", chainNotAfter(g),
-            servedCertificate(probe(), discoveryPort(g)).getNotAfter().getTime());
-
-        long next = dueTime(g);
-
-        assertTrue(waitForCondition(() -> nextRenewalTime(g) == next, 10_000));
-
-        assertTrue("A node renewing certificates must run the renewal thread", renewalThreadAlive(g.name()));
-
-        stopGrid(0);
-
-        assertTrue("The renewal thread must stop with the node", waitForCondition(() -> !renewalThreadAlive(g.name()), 10_000));
+        assertSame(renewed.context(), p.context());
+        assertEquals(Map.of("new-1", chain(new1), "new-2", chain(new2)), p.certificateChains());
     }
 
-    /** Plans renewal from the authority's expiry when it expires before the leaf certificate. */
-    @Test
-    public void testRenewalPlannedBeforeAuthorityExpiry() throws Exception {
-        long now = System.currentTimeMillis() / SECOND * SECOND;
-        long notBefore = now - HOUR;
-        long authorityExpiry = now + HOUR;
-
-        ca = new TestCertificateAuthority("renewalca", notBefore - HOUR, authorityExpiry);
-
-        KeyStore keys = ca.keyStoreWithPrivateKey(notBefore, authorityExpiry + HOUR);
-
-        long due = authorityExpiry - (long)((authorityExpiry - notBefore) * DFLT_RENEW_BEFORE_FRACTION);
-
-        IgniteEx g = startNode(new Issuer(() -> keys));
-
-        assertTrue("Renewal must be planned by the authority's expiry",
-            waitForCondition(() -> nextRenewalTime(g) == due, 10_000));
-    }
-
-    /** Every private key affects the renewal date; equal expiries use the earliest leaf validity start. */
-    @Test
-    public void testRenewalPlannedByEarliestKey() throws Exception {
-        long now = System.currentTimeMillis() / SECOND * SECOND;
-        long firstExpiry = now + 2 * HOUR;
-        long secondNotBefore = now - 2 * HOUR;
-        String firstAlias = "first";
-        String secondAlias = "second";
-
-        for (long secondExpiry : List.of(now + HOUR, firstExpiry)) {
-            KeyStore keys = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, firstExpiry);
-
-            addKey(keys, ca.keyStoreWithPrivateKey(secondAlias, secondNotBefore, secondExpiry), secondAlias);
-
-            Issuer issuer = new Issuer(() -> keys);
-            SslContextProvider p = new SslContextProvider(issuer);
-            ScheduledThreadPoolExecutor exec = new ScheduledThreadPoolExecutor(1);
-
-            try {
-                p.startRenewal(exec, log);
-
-                exec.submit(() -> {}).get(10, TimeUnit.SECONDS);
-
-                long expected = secondExpiry - (long)((secondExpiry - secondNotBefore) * DFLT_RENEW_BEFORE_FRACTION);
-
-                assertEquals(expected, p.nextRenewalTime());
-                assertEquals(2, p.certificateChains().size());
-                assertEquals(1, issuer.calls.size());
-            }
-            finally {
-                exec.shutdownNow();
-
-                assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
-            }
-        }
-    }
-
-    /** Rotation replaces all chains together and does not require old and new private-key aliases to match. */
-    @Test
-    public void testAllKeysRenewedTogether() throws Exception {
-        long now = System.currentTimeMillis() / SECOND * SECOND;
-        long originalExpiry = now + HOUR;
-        long replacementExpiry = now + 2 * HOUR;
-        String firstAlias = "first";
-        String secondAlias = "second";
-        String replacementAlias = "replacement";
-        String otherReplacementAlias = "other-replacement";
-
-        KeyStore original = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, originalExpiry);
-        KeyStore replacement = ca.keyStoreWithPrivateKey(replacementAlias, now - HOUR, replacementExpiry);
-
-        addKey(original, ca.keyStoreWithPrivateKey(secondAlias, now - HOUR, originalExpiry), secondAlias);
-        addKey(replacement, ca.keyStoreWithPrivateKey(otherReplacementAlias, now - HOUR, replacementExpiry), otherReplacementAlias);
-
-        SslContextProvider p = new SslContextProvider(new Issuer(() -> original, () -> original, () -> replacement));
-        SslBundle before = p.bundle();
-
-        assertNull(p.renew(before.context()));
-        assertEquals(1, p.renewalFailures());
-
-        SslBundle renewed = p.renew(before.context());
-
-        assertSame(renewed, p.bundle());
-        assertNotSame(before.context(), renewed.context());
-        assertEquals(2, renewed.certificateChains().size());
-        assertEquals(replacement.getCertificate(replacementAlias), renewed.certificateChains().get(replacementAlias).get(0));
-        assertEquals(replacement.getCertificate(otherReplacementAlias), renewed.certificateChains().get(otherReplacementAlias).get(0));
-        assertEquals(replacementExpiry, SslCertificates.chainNotAfter(SslContextProvider.renewalChain(renewed)));
-        assertEquals(0, p.renewalFailures());
-    }
-
-    /** A replacement cannot leave another key at the original earliest expiry. */
-    @Test
-    public void testPartialRotationDoesNotAdvanceEarliestExpiry() throws Exception {
-        long now = System.currentTimeMillis() / SECOND * SECOND;
-        long originalExpiry = now + HOUR;
-        String firstAlias = "first";
-        String unchangedAlias = "unchanged";
-        KeyStore unchanged = ca.keyStoreWithPrivateKey(unchangedAlias, now - HOUR, originalExpiry);
-        KeyStore original = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, originalExpiry);
-        KeyStore replacement = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, originalExpiry + HOUR);
-
-        addKey(original, unchanged, unchangedAlias);
-        addKey(replacement, unchanged, unchangedAlias);
-
-        SslContextProvider p = new SslContextProvider(new Issuer(() -> original, () -> replacement));
-
-        assertRenewalRejected(p, "The new certificate chains expire no later than the ones in use");
-    }
-
-    /** Every candidate chain must be valid even when another key has been renewed successfully. */
-    @Test
-    public void testInvalidSecondaryChainRejected() throws Exception {
-        long now = System.currentTimeMillis();
-        String validAlias = "first";
-        String invalidAlias = "second";
-        KeyStore original = ca.keyStoreWithPrivateKey(validAlias, now - HOUR, now + HOUR);
-        KeyStore replacement = ca.keyStoreWithPrivateKey(validAlias, now - HOUR, now + 2 * HOUR);
-
-        addKey(replacement, ca.keyStoreWithPrivateKey(invalidAlias, now + HOUR, now + 3 * HOUR), invalidAlias);
-
-        SslContextProvider p = new SslContextProvider(new Issuer(() -> original, () -> replacement));
-
-        assertRenewalRejected(p, "The new certificate chain is not valid now [alias=" + invalidAlias);
-    }
-
-    /** With less than half of the window left, failures must be logged as errors and counted, and the status must show the next attempt. */
-    @Test
-    public void testLateFailureLoggedAsError() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = window / 4;
-        long notAfter = now + timeLeft;
-
-        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), failure());
-
-        IgniteEx g = startNode(issuer);
-
-        String late = "Failed to reload TLS certificates, the ones in use stay and expire soon [" + NODE_TRANSPORTS +
-            ", initiator=automatic renewal, reason=" + ISSUER_DOWN;
-
-        assertTrue(waitForCondition(() -> logged(Level.ERROR, late) >= 2, 30_000));
-
-        assertTrue(metrics(g).<IntMetric>findMetric("ConsecutiveRenewalFailures").value() >= 2);
-        assertContains(log, status(g), "next automatic renewal at");
-    }
-
-    /** A certificate that expires no later than the one in use must not be put in use. */
-    @Test
-    public void testRenewalNotMovingExpiryRejected() throws Exception {
-        long now = System.currentTimeMillis();
-        long notBefore = now - HOUR;
-        long notAfter = now + HOUR;
-        KeyStore startupKeys = ca.keyStoreWithPrivateKey("startup", notBefore, notAfter);
-        KeyStore replacement = ca.keyStoreWithPrivateKey("replacement", notBefore, notAfter);
-
-        SslContextProvider p = new SslContextProvider(new Issuer(() -> startupKeys, () -> replacement));
-
-        assertRenewalRejected(p, "The new certificate chains expire no later than the ones in use");
-    }
-
-    /** An automatic renewal preserves connections to a peer whose certificate and different authority stay unchanged. */
-    @Test
-    public void testRenewalWithDifferentAuthorities() throws Exception {
-        assertNodesReconnectAfterRotationAndRestart(new TestCertificateAuthority("peerca"));
-    }
-
-    /** An expired certificate can be replaced with a valid chain from another authority. */
+    /** renew replaces an expired certificate in use with a valid one. */
     @Test
     public void testExpiredCertificateRenewed() throws Exception {
         long now = System.currentTimeMillis();
-        String authorityName = "otherca";
+        KeyStore valid = ca.keyStoreWithPrivateKey("valid", now - HOUR, now + HOUR);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
 
-        TestCertificateAuthority other = new TestCertificateAuthority(authorityName);
+        when(f.createSslBundle()).thenReturn(
+            bundle(ca.keyStoreWithPrivateKey("expired", now - 2 * HOUR, now - HOUR), ca.trustStore()),
+            bundle(valid, ca.trustStore()));
 
-        Issuer issuer = new Issuer(valid(now - 2 * HOUR, now - HOUR), () -> other.keyStoreWithPrivateKey(now, now + HOUR));
+        SslContextProvider p = new SslContextProvider(f);
 
-        SslContextProvider p = new SslContextProvider(issuer);
+        p.renew(p.context());
 
-        p.addTransport(COMMUNICATION);
-
-        issuer.trust = other.trustStore();
-
-        assertNotNull(p.renew(p.context()));
-        assertEquals("CN=" + authorityName, certificate(p).getIssuerX500Principal().getName());
+        assertEquals(Map.of("valid", chain(valid)), p.certificateChains());
     }
 
-    /** A renewal logs the certificate it installed even if a manual reload replaces it before the log is written. */
+    /**
+     * renew refuses new chains unless the earliest expiry across them, authorities included, is later than the one in use: here
+     * another key with the same expiry, one of two keys renewed, and a later leaf from an authority that expires no later.
+     */
+    @Test
+    public void testRenewalMustAdvanceEarliestExpiry() throws Exception {
+        long now = System.currentTimeMillis();
+        String reason = "The new certificate chains expire no later than the ones in use";
+        TestCertificateAuthority shortCa = new TestCertificateAuthority("short-ca", now - HOUR, now + HOUR);
+        KeyStore a = ca.keyStoreWithPrivateKey("a", now - HOUR, now + HOUR);
+        KeyStore b = ca.keyStoreWithPrivateKey("b", now - HOUR, now + HOUR);
+        KeyStore renewedA = ca.keyStoreWithPrivateKey("a", now - HOUR, now + 2 * HOUR);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(
+            bundle(merged(a, b), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("other", now - HOUR, now + HOUR), ca.trustStore()),
+            bundle(merged(renewedA, b), ca.trustStore()),
+            bundle(shortCa.keyStoreWithPrivateKey("short-ca-leaf", now - HOUR, now + 2 * HOUR), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        assertRenewalRejected("Another key with the same expiry", p, reason);
+        assertRenewalRejected("One of two keys renewed", p, reason);
+        assertRenewalRejected("A later leaf from an authority that expires no later", p, reason);
+    }
+
+    /** renew applies the checks of reload: here a candidate without a private key and one that is not valid yet are refused. */
+    @Test
+    public void testRenewalAppliesReloadChecks() throws Exception {
+        long now = System.currentTimeMillis();
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(
+            bundle(ca.keyStoreWithPrivateKey("startup", now - HOUR, now + HOUR), ca.trustStore()),
+            bundle(ca.trustStore(), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("not-yet-valid", now + 10 * MINUTE, now + 2 * HOUR), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        assertRenewalRejected("No private key", p, "The new key material has no private key, so the node would present no certificate");
+        assertRenewalRejected("Not valid yet", p, "The new certificate chain is not valid now [alias=not-yet-valid, ");
+    }
+
+    /** New metadata cannot make the context in use, which a caching factory returns again, serve a renewed certificate. */
+    @Test
+    public void testChangedMetadataCannotRenewCachedContext() throws Exception {
+        long now = System.currentTimeMillis();
+        SslBundle startup = bundle(ca.keyStoreWithPrivateKey("startup", now - HOUR, now + HOUR), ca.trustStore());
+        KeyStore renewed = ca.keyStoreWithPrivateKey("renewed", now - HOUR, now + 2 * HOUR);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(startup, new SslBundle(startup.context(), Map.of("renewed", chain(renewed))));
+
+        assertRenewalRejected("Cached context", new SslContextProvider(f), "The SSL context factory returns the context in use");
+    }
+
+    /**
+     * The chains in use mean that the factory has nothing newer yet: renew returns {@code null} and counts an unsuccessful renewal,
+     * but records no reload failure. Here a caching factory returns the bundle in use, and another factory returns the expired
+     * chains in use, which the validity check would refuse.
+     */
+    @Test
+    public void testUnchangedCertificatesAwaited() throws Exception {
+        long now = System.currentTimeMillis();
+        SslBundle cached = bundle(ca.keyStoreWithPrivateKey("cached"), ca.trustStore());
+        KeyStore expired = ca.keyStoreWithPrivateKey("expired", now - 2 * HOUR, now - HOUR);
+        AbstractSslContextFactory caching = renewingFactory(QUARTER);
+        AbstractSslContextFactory expiredAgain = renewingFactory(QUARTER);
+
+        when(caching.createSslBundle()).thenReturn(cached);
+        when(expiredAgain.createSslBundle()).thenReturn(bundle(expired, ca.trustStore()), bundle(expired, ca.trustStore()));
+
+        SslContextProvider cachingProvider = new SslContextProvider(caching);
+        SslContextProvider expiredProvider = new SslContextProvider(expiredAgain);
+
+        assertNull("Cached bundle", cachingProvider.renew(cachingProvider.context()));
+        assertEquals("Cached bundle", 1, cachingProvider.renewalFailures());
+        assertEquals("Cached bundle", new ReloadOutcome(0, 0, null, 0), cachingProvider.reloadOutcome());
+
+        assertNull("Expired chains", expiredProvider.renew(expiredProvider.context()));
+        assertEquals("Expired chains", 1, expiredProvider.renewalFailures());
+        assertEquals("Expired chains", new ReloadOutcome(0, 0, null, 0), expiredProvider.reloadOutcome());
+    }
+
+    /** renew planned for a context that a reload has replaced does not call the factory and changes nothing. */
+    @Test
+    public void testRenewForReplacedContextDoesNothing() throws Exception {
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(
+            bundle(ca.keyStoreWithPrivateKey("startup"), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("reloaded"), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+        SSLContext planned = p.context();
+
+        p.reload();
+
+        SslBundle reloaded = p.bundle();
+
+        assertNull(p.renew(planned));
+        assertSame(reloaded, p.bundle());
+        assertEquals(0, p.renewalFailures());
+        verify(f, times(2)).createSslBundle();
+    }
+
+    /**
+     * renew interrupted while the factory loads changes nothing and keeps the interrupt flag, whether the factory returns the chains
+     * in use or new ones: the interrupt is checked before both the comparison with the chains in use and the installation.
+     */
+    @Test
+    public void testInterruptedRenewalChangesNothing() throws Exception {
+        long now = System.currentTimeMillis();
+        KeyStore startup = ca.keyStoreWithPrivateKey("startup", now - HOUR, now + HOUR);
+        SslBundle same = bundle(startup, ca.trustStore());
+        SslBundle renewed = bundle(ca.keyStoreWithPrivateKey("renewed", now - HOUR, now + 2 * HOUR), ca.trustStore());
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle())
+            .thenReturn(bundle(startup, ca.trustStore()))
+            .thenAnswer(inv -> {
+                Thread.currentThread().interrupt();
+
+                return same;
+            })
+            .thenAnswer(inv -> {
+                Thread.currentThread().interrupt();
+
+                return renewed;
+            });
+
+        SslContextProvider p = new SslContextProvider(f);
+        SslBundle inUse = p.bundle();
+
+        try {
+            GridTestUtils.assertThrows(log, () -> p.renew(inUse.context()), IgniteInterruptedCheckedException.class, null);
+        }
+        finally {
+            assertTrue("Same chains: the interrupt flag stays set", Thread.interrupted());
+        }
+
+        Assert.assertSame("Same chains", inUse, p.bundle());
+        assertEquals("Same chains", 0, p.renewalFailures());
+        assertEquals("Same chains", new ReloadOutcome(0, 0, null, 0), p.reloadOutcome());
+
+        try {
+            GridTestUtils.assertThrows(log, () -> p.renew(inUse.context()), IgniteInterruptedCheckedException.class, null);
+        }
+        finally {
+            assertTrue("New chains: the interrupt flag stays set", Thread.interrupted());
+        }
+
+        Assert.assertSame("New chains", inUse, p.bundle());
+        assertEquals("New chains", 0, p.renewalFailures());
+        assertEquals("New chains", new ReloadOutcome(0, 0, null, 0), p.reloadOutcome());
+    }
+
+    /**
+     * With renewal enabled at creation, reload refuses a bundle without certificate metadata, even after the factory has turned
+     * renewal off: the renewal settings are fixed when the provider is created. renew refuses such a bundle too.
+     */
+    @Test
+    public void testReloadCannotLoseMetadataWithRenewal() throws Exception {
+        String reason = "The new SSL context must provide a nonempty certificate chain for every private key to renew automatically";
+        SslBundle startup = bundle(ca.keyStoreWithPrivateKey("startup"), ca.trustStore());
+        SslBundle unknown = new SslBundle(context(ca.keyStoreWithPrivateKey("unknown"), ca.trustStore()), null);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(startup, unknown, unknown);
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        when(f.isRenewalEnabled()).thenReturn(false);
+
+        GridTestUtils.assertThrows(log, p::reload, IgniteCheckedException.class, reason);
+
+        assertSame(startup, p.bundle());
+        assertRenewalRejected("Renewal", p, reason);
+    }
+
+    /** Renewal does not start without a nonempty chain for every private key: no metadata, no private key, a key without a chain. */
+    @Test
+    public void testRenewalRefusedToStartWithoutChains() throws Exception {
+        KeyStore valid = ca.keyStoreWithPrivateKey("a-valid");
+        SSLContext ctx = context(valid, ca.trustStore());
+        AbstractSslContextFactory unknown = renewingFactory(QUARTER);
+        AbstractSslContextFactory noKey = renewingFactory(QUARTER);
+        AbstractSslContextFactory noChain = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(unknown.createSslBundle()).thenReturn(new SslBundle(ctx, null));
+        when(noKey.createSslBundle()).thenReturn(bundle(ca.trustStore(), ca.trustStore()));
+        // Aliases are sorted, so "z-" puts the key without a chain after a valid one: the check must go past the first key.
+        when(noChain.createSslBundle()).thenReturn(new SslBundle(ctx, Map.of("a-valid", chain(valid), "z-no-chain", List.of())));
+
+        SslContextProvider unknownProvider = new SslContextProvider(unknown);
+        SslContextProvider noKeyProvider = new SslContextProvider(noKey);
+        SslContextProvider noChainProvider = new SslContextProvider(noChain);
+
+        GridTestUtils.assertThrows(log, () -> unknownProvider.startRenewal(exec, renewalLog), IgniteException.class,
+            "The SSL context factory must provide a nonempty certificate chain for every private key to renew automatically");
+        GridTestUtils.assertThrows(log, () -> noKeyProvider.startRenewal(exec, renewalLog), IgniteException.class,
+            "The new key material has no private key, so the node would present no certificate");
+        GridTestUtils.assertThrows(log, () -> noChainProvider.startRenewal(exec, renewalLog), IgniteException.class,
+            "The private key has no X.509 certificate chain; remove the key or provide its X.509 certificate chain [alias=z-no-chain]");
+    }
+
+    /** Both the chains in use and a factory failure count as unsuccessful renewals, and a renewal clears the count. */
+    @Test
+    public void testUnsuccessfulRenewalsCounted() throws Exception {
+        long now = System.currentTimeMillis();
+        KeyStore inUse = ca.keyStoreWithPrivateKey("in-use", now - HOUR, now + HOUR);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle())
+            .thenReturn(bundle(inUse, ca.trustStore()), bundle(inUse, ca.trustStore()))
+            .thenThrow(new IgniteException(ISSUER_DOWN))
+            .thenReturn(bundle(ca.keyStoreWithPrivateKey("renewed", now - HOUR, now + 2 * HOUR), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        assertNull(p.renew(p.context()));
+        assertEquals("Chains in use", 1, p.renewalFailures());
+
+        GridTestUtils.assertThrows(log, () -> p.renew(p.context()), IgniteException.class, ISSUER_DOWN);
+
+        assertEquals("Factory failure", 2, p.renewalFailures());
+
+        assertNotNull(p.renew(p.context()));
+        assertEquals("Renewed", 0, p.renewalFailures());
+    }
+
+    /**
+     * Reload is not a renewal attempt: a failed reload does not count, and a successful one clears the count only if the earliest
+     * expiry advances. Another certificate with the same expiry and a later leaf whose authority expires at the same time do not.
+     */
+    @Test
+    public void testReloadClearsRenewalFailuresOnlyWithLaterExpiry() throws Exception {
+        long now = System.currentTimeMillis();
+        TestCertificateAuthority shortCa = new TestCertificateAuthority("short-ca", now - HOUR, now + HOUR);
+        KeyStore inUse = ca.keyStoreWithPrivateKey("in-use", now - HOUR, now + HOUR);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle())
+            .thenReturn(bundle(inUse, ca.trustStore()), bundle(inUse, ca.trustStore()))
+            .thenThrow(new IgniteException(ISSUER_DOWN))
+            .thenReturn(
+                bundle(ca.keyStoreWithPrivateKey("same-expiry", now - HOUR, now + HOUR), ca.trustStore()),
+                bundle(shortCa.keyStoreWithPrivateKey("later-leaf", now - HOUR, now + 2 * HOUR), ca.trustStore()),
+                bundle(ca.keyStoreWithPrivateKey("later-chain", now - HOUR, now + 2 * HOUR), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        p.renew(p.context());
+
+        GridTestUtils.assertThrows(log, p::reload, IgniteException.class, ISSUER_DOWN);
+
+        assertEquals("Failed reload", 1, p.renewalFailures());
+
+        p.reload();
+
+        assertEquals("Same expiry", 1, p.renewalFailures());
+
+        p.reload();
+
+        assertEquals("Later leaf, authority expires at the same time", 1, p.renewalFailures());
+
+        p.reload();
+
+        assertEquals("Later chain expiry", 0, p.renewalFailures());
+    }
+
+    /**
+     * The first attempt comes when the window of the chain that expires first opens: the window is a share of that chain's lifetime,
+     * which runs from its leaf validity start to its earliest expiry. Equal expiries go to the chain with the earliest leaf validity
+     * start, and an authority that expires before the leaf decides. Aliases put the expected chain second.
+     */
+    @Test
+    public void testFirstAttemptAtWindowOfEarliestChain() throws Exception {
+        // X.509 keeps whole seconds.
+        long now = System.currentTimeMillis() / SECOND * SECOND;
+        TestCertificateAuthority shortCa = new TestCertificateAuthority("short-ca", now - 2 * HOUR, now + HOUR);
+
+        KeyStore earliestExpiry = merged(
+            ca.keyStoreWithPrivateKey("a-later-expiry", now - HOUR, now + 3 * HOUR),
+            ca.keyStoreWithPrivateKey("b-earlier-expiry", now - HOUR, now + HOUR));
+        KeyStore equalExpiry = merged(
+            ca.keyStoreWithPrivateKey("a-later-start", now - HOUR, now + 2 * HOUR),
+            ca.keyStoreWithPrivateKey("b-earlier-start", now - 2 * HOUR, now + 2 * HOUR));
+
+        assertEquals("Earliest expiry", now + HOUR - 30 * MINUTE, firstAttempt(QUARTER, earliestExpiry));
+        assertEquals("Equal expiry, earlier start", now + 2 * HOUR - HOUR, firstAttempt(QUARTER, equalExpiry));
+        assertEquals("Authority expires first", now + HOUR - 30 * MINUTE,
+            firstAttempt(QUARTER, shortCa.keyStoreWithPrivateKey("leaf", now - HOUR, now + 3 * HOUR)));
+    }
+
+    /**
+     * After a successful renewal or reload, the next attempt comes no sooner than a minute later, even for a certificate in its
+     * window. Here every certificate is in its window: renewal plans, attempts at once and renews, then plans again, and a reload
+     * then replaces the renewed certificate.
+     */
+    @Test
+    public void testNextAttemptNotSoonerThanMinPause() throws Exception {
+        long now = System.currentTimeMillis();
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(f.createSslBundle()).thenReturn(
+            bundle(ca.keyStoreWithPrivateKey("startup", now - 100 * MINUTE, now + 20 * MINUTE), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("renewed", now - 95 * MINUTE, now + 25 * MINUTE), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("reloaded", now - 90 * MINUTE, now + 30 * MINUTE), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+        exec.runNext();
+        exec.runNext();
+
+        assertEquals("Renewal", p.reloadOutcome().successTime() + MINUTE, p.nextRenewalTime());
+
+        p.reload();
+        exec.runNext();
+
+        assertEquals("Reload", p.reloadOutcome().successTime() + MINUTE, p.nextRenewalTime());
+    }
+
+    /**
+     * Failed attempts are retried after 1, 2, 4 and so on up to 60 minutes, then every 60 minutes, each plus up to half of it; the
+     * executor gets the delay to the retry time, and every failure is logged, unlike a wait. The clock does not stop between the
+     * attempts, so each retry time and delay is checked against the clock before and after the attempt.
+     */
+    @Test
+    public void testFailedAttemptsBackOff() throws Exception {
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(f.createSslBundle())
+            .thenReturn(bundle(ca.keyStoreWithPrivateKey("startup"), ca.trustStore()))
+            .thenThrow(new IgniteException(ISSUER_DOWN));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+
+        for (long pause : new long[] {1, 2, 4, 8, 16, 32, 60, 60}) {
+            long before = System.currentTimeMillis();
+
+            exec.runNext();
+
+            long after = System.currentTimeMillis();
+            long next = p.nextRenewalTime();
+            long delay = exec.last().getDelay(TimeUnit.MILLISECONDS);
+
+            assertTrue("Pause of " + pause + " min: " + (next - before) + " ms",
+                next >= before + pause * MINUTE && next <= after + pause * MINUTE * 3 / 2);
+            assertTrue("Delay of the " + pause + "-minute retry: " + delay + " ms", delay >= next - after && delay <= next - before);
+        }
+
+        assertEquals(Collections.nCopies(8, "WARN " + FAILED), problems());
+    }
+
+    /**
+     * Reload replans renewal: it cancels the planned retry, plans the next attempt at the window of the new certificate, resets
+     * the retry pause and lets renewal warn again that the factory has nothing newer.
+     */
+    @Test
+    public void testReloadReplans() throws Exception {
+        // X.509 keeps whole seconds.
+        long now = System.currentTimeMillis() / SECOND * SECOND;
+        SslBundle startup = bundle(ca.keyStoreWithPrivateKey("startup", now - 100 * MINUTE, now + 20 * MINUTE), ca.trustStore());
+        SslBundle reloaded = bundle(ca.keyStoreWithPrivateKey("reloaded", now, now + 2 * HOUR), ca.trustStore());
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(f.createSslBundle()).thenReturn(startup, startup, reloaded, reloaded);
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+        exec.runNext();
+
+        ScheduledFuture<?> retry = exec.last();
+
+        p.reload();
+        exec.runNext();
+
+        assertTrue(retry.isCancelled());
+        assertEquals(now + 2 * HOUR - 30 * MINUTE, p.nextRenewalTime());
+
+        long before = System.currentTimeMillis();
+
+        exec.runNext();
+
+        long after = System.currentTimeMillis();
+        long next = p.nextRenewalTime();
+
+        assertTrue("Retry after the reload: " + (next - before) + " ms", next >= before + MINUTE && next <= after + MINUTE * 3 / 2);
+        assertEquals(List.of("WARN " + WAITING, "WARN " + WAITING), problems());
+    }
+
+    /**
+     * An attempt planned for a context that a reload has replaced, here run before the plan of the reload, does not call the
+     * factory, log or schedule a retry: only the plan of the reload stays pending.
+     */
+    @Test
+    public void testStaleAttemptNotRetried() throws Exception {
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(f.createSslBundle()).thenReturn(
+            bundle(ca.keyStoreWithPrivateKey("startup"), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("reloaded"), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+
+        Task stale = exec.last();
+
+        p.reload();
+
+        Task plan = exec.last();
+
+        stale.run();
+
+        verify(f, times(2)).createSslBundle();
+        assertEquals(List.of(), problems());
+        assertEquals(List.of(plan), exec.pending());
+    }
+
+    /**
+     * An attempt runs without the operation context of whoever started renewal, here an operator, even on the executor of a node,
+     * which passes the context of a submitter to its tasks. The factory sees the operator when the provider is created under it.
+     */
+    @Test
+    public void testRenewalRunsWithoutOperatorContext() throws Exception {
+        long now = System.currentTimeMillis();
+        SslBundle inWindow = bundle(ca.keyStoreWithPrivateKey("in-window", now - 100 * MINUTE, now + 20 * MINUTE), ca.trustStore());
+        List<String> operators = new CopyOnWriteArrayList<>();
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        ScheduledExecutorService exec = newSingleThreadScheduledExecutor("ssl-renewal", getTestIgniteInstanceName());
+
+        when(f.createSslBundle()).thenAnswer(inv -> {
+            operators.add(OperationContext.get(OPERATOR));
+
+            return inWindow;
+        });
+
+        try {
+            try (Scope ignored = OperationContext.set(OPERATOR, "operator")) {
+                new SslContextProvider(f).startRenewal(exec, renewalLog);
+            }
+
+            assertTrue(waitForCondition(() -> operators.size() == 2, 10_000));
+            assertEquals(Arrays.asList("operator", null), operators);
+        }
+        finally {
+            exec.shutdownNow();
+
+            assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    /** The log names the certificate an attempt installed, even if a reload replaces it before the attempt logs it. */
     @Test
     public void testRenewalLogsAppliedCertificate() throws Exception {
         long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-        String renewedName = "renewed";
-        String manualName = "manual";
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
 
-        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter),
-            () -> ca.keyStoreWithPrivateKey(renewedName, now, now + HOUR),
-            () -> ca.keyStoreWithPrivateKey(manualName, now, now + 2 * HOUR));
+        when(f.createSslBundle()).thenReturn(
+            bundle(ca.keyStoreWithPrivateKey("startup", now - HOUR, now + HOUR), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("renewed", now - HOUR, now + 2 * HOUR), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("reloaded", now - HOUR, now + 3 * HOUR), ca.trustStore()));
 
-        SslContextProvider p = new SslContextProvider(issuer) {
+        SslContextProvider p = new SslContextProvider(f) {
+            /** {@inheritDoc} */
             @Override SslBundle renew(SSLContext expected) throws IgniteCheckedException {
                 SslBundle renewed = super.renew(expected);
 
-                if (renewed != null)
-                    super.reload();
+                super.reload();
 
                 return renewed;
             }
         };
 
-        p.addTransport(COMMUNICATION);
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+        exec.runNext();
 
-        ScheduledThreadPoolExecutor exec = new ScheduledThreadPoolExecutor(1);
+        List<String> reloadedLogs = appender.events().stream().map(e -> e.getMessage().getFormattedMessage())
+            .filter(msg -> msg.startsWith("TLS certificates reloaded [")).toList();
 
-        try {
-            p.startRenewal(exec, log.getLogger(SslRenewal.class));
-
-            assertTrue(waitForCondition(() -> automaticRenewals("transports=" + COMMUNICATION) == 1, 10_000));
-            assertEquals("CN=" + manualName, certificate(p).getSubjectX500Principal().getName());
-            assertEquals(1, logged(Level.INFO,
-                "TLS certificates reloaded [transports=" + COMMUNICATION + ", alias=" + renewedName + ", subject=CN=" + renewedName + ','));
-        }
-        finally {
-            exec.shutdownNow();
-
-            assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
-        }
-    }
-
-    /** A certificate that is not valid yet must not be put in use. */
-    @Test
-    public void testRenewalNotValidYetRejected() {
-        long now = System.currentTimeMillis();
-
-        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR), valid(now + 10 * MINUTE, now + 2 * HOUR)));
-
-        assertRenewalRejected(p, "The new certificate chain is not valid now");
-    }
-
-    /** A renewal planned before a reload must not ask for a certificate or replace the one the reload has put in use. */
-    @Test
-    public void testRenewalPlannedBeforeReloadSuperseded() throws Exception {
-        KeyStore inUse = ca.keyStoreWithPrivateKey();
-
-        Issuer issuer = new Issuer(() -> inUse);
-
-        SslContextProvider p = new SslContextProvider(issuer);
-
-        SSLContext planned = p.context();
-
-        assertNull(p.renew(planned));
-        assertEquals(1, p.renewalFailures());
-
-        p.reload();
-
-        SSLContext reloaded = p.context();
-        int callsAfterReload = issuer.calls.size();
-
-        assertNotSame(planned, reloaded);
-
-        assertNull(p.renew(planned));
-        assertEquals(1, p.renewalFailures());
-        assertSame(reloaded, p.context());
-        assertEquals("The superseded renewal must not ask for another certificate", callsAfterReload, issuer.calls.size());
-    }
-
-    /** A reload during renewal planning prevents the outdated attempt from calling the factory or replacing the new context. */
-    @Test
-    public void testReloadDuringRenewalPlanning() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-
-        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), fresh(2 * HOUR), fresh(3 * HOUR));
-
-        CountDownLatch planRead = new CountDownLatch(1);
-        CountDownLatch continuePlanning = new CountDownLatch(1);
-        CountDownLatch reloaded = new CountDownLatch(1);
-        CountDownLatch allowReplan = new CountDownLatch(1);
-        CountDownLatch attemptStarted = new CountDownLatch(1);
-
-        AtomicBoolean firstPlan = new AtomicBoolean(true);
-        AtomicReference<Thread> reloadThread = new AtomicReference<>();
-
-        SslContextProvider p = new SslContextProvider(issuer) {
-            @Override public ReloadOutcome reloadOutcome() {
-                ReloadOutcome outcome = super.reloadOutcome();
-
-                if (firstPlan.getAndSet(false)) {
-                    planRead.countDown();
-
-                    U.awaitQuiet(continuePlanning);
-                }
-
-                return outcome;
-            }
-
-            @Override SslBundle renew(SSLContext expected) throws IgniteCheckedException {
-                attemptStarted.countDown();
-
-                return super.renew(expected);
-            }
-        };
-
-        ScheduledThreadPoolExecutor exec = new ScheduledThreadPoolExecutor(1) {
-            @Override public ScheduledFuture<?> schedule(Runnable task, long delay, TimeUnit unit) {
-                if (Thread.currentThread() == reloadThread.get()) {
-                    reloaded.countDown();
-
-                    U.awaitQuiet(allowReplan);
-                }
-
-                return super.schedule(task, delay, unit);
-            }
-        };
-        IgniteInternalFuture<?> reload = null;
-
-        try {
-            p.startRenewal(exec, log);
-
-            assertTrue(planRead.await(10, TimeUnit.SECONDS));
-
-            reload = GridTestUtils.runAsync(() -> {
-                reloadThread.set(Thread.currentThread());
-
-                p.reload();
-
-                return null;
-            });
-
-            assertTrue(reloaded.await(10, TimeUnit.SECONDS));
-
-            SSLContext inUse = p.context();
-
-            // Let the old plan start its attempt before the reload queues a new plan.
-            continuePlanning.countDown();
-
-            assertTrue(attemptStarted.await(10, TimeUnit.SECONDS));
-
-            allowReplan.countDown();
-
-            reload.get(10_000);
-            exec.submit(() -> {}).get(10, TimeUnit.SECONDS);
-
-            assertEquals("Only the initial load and the manual reload may call the factory", 2, issuer.calls.size());
-            assertSame(inUse, p.context());
-            assertTrue("The next attempt must follow the new certificate", p.nextRenewalTime() > now + HOUR);
-        }
-        finally {
-            continuePlanning.countDown();
-            allowReplan.countDown();
-
-            exec.shutdownNow();
-
-            if (reload != null)
-                reload.get(10_000);
-
-            assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
-        }
-    }
-
-    /** A successful reload by the command must cancel the planned retry and plan the next renewal by the new certificate. */
-    @Test
-    public void testReloadByCommandReplans() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-
-        pauses(MINUTE, MINUTE);
-
-        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), failure(), fresh(2 * HOUR), fresh(HOUR));
-
-        IgniteEx g = startNode(issuer);
-
-        assertTrue(waitForCondition(() -> logged(Level.WARN, ISSUER_DOWN) == 1, 30_000));
-
-        long retry = nextRenewalTime(g);
-
-        assertTrue("A retry must be planned after the pause",
-            retry >= provider(g).reloadOutcome().failureTime() + MINUTE - CLOCK_SLACK);
-
-        reload(g);
-
-        long due = dueTime(g);
-
-        assertTrue(waitForCondition(() -> nextRenewalTime(g) == due, 10_000));
-
-        assertTrue("The next renewal must follow the new certificate", due > now + HOUR);
-
-        ScheduledThreadPoolExecutor exec = GridTestUtils.getFieldValue(g.context().sslContexts(), "renewalExec", "delegate");
-
-        assertTrue("The cancelled retry must not stay planned", exec.getQueue().stream().map(t -> (RunnableScheduledFuture<?>)t)
-            .filter(f -> !f.isCancelled()).allMatch(f -> f.getDelay(TimeUnit.MILLISECONDS) > HOUR));
-    }
-
-    /** Renewals must run in an operation context of their own, not in the one of whoever ran a reload before them. */
-    @Test
-    public void testReloadContextNotCarriedIntoRenewals() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-        String operator = "operator";
-
-        Issuer issuer = new Issuer(fresh(HOUR), valid(notAfter - lifetime, notAfter), fresh(HOUR));
-
-        IgniteEx g = startNode(issuer);
-
-        try (Scope ignored = OperationContext.set(OPERATOR, operator)) {
-            provider(g).reload();
-        }
-
-        assertTrue(waitForCondition(() -> automaticRenewals(NODE_TRANSPORTS) == 1, 30_000));
-
-        assertEquals(operator, issuer.calls.get(1).operator);
-        assertNull("The renewal must not run as the operator", issuer.calls.get(2).operator);
+        assertEquals(reloadedLogs.toString(), 1, reloadedLogs.size());
+        assertContains(log, reloadedLogs.get(0), ", alias=renewed, subject=CN=renewed, ");
     }
 
     /**
-     * A failed renewal must be retried until it succeeds. Each pause must double, from the shortest to the longest one. While more
-     * than half of the window is left, each failure must be logged as a warning. The success must clear the count of failures.
+     * A failure is a warning while more than half of the window is left and an error once less is left, the retry a minute later
+     * comes after expiry or the certificates have expired. In each case the first failure is logged with its stack trace.
      */
     @Test
-    public void testFailedRenewalRetried() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-        long minPause = 100;
-        long maxPause = 4 * minPause;
-
-        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter),
-            failure(), failure(), failure(), failure(), failure(), failure(), fresh(HOUR));
-
-        pauses(minPause, maxPause);
-
-        IgniteEx g = startNode(issuer);
-
-        assertTrue(waitForCondition(() -> automaticRenewals("transports=" + COMMUNICATION) == 1, 30_000));
-
-        long[] pauses = {minPause, 2 * minPause, maxPause, maxPause, maxPause};
-
-        for (int i = 0; i < pauses.length; i++) {
-            long pause = issuer.calls.get(i + 2).time - issuer.calls.get(i + 1).time;
-
-            assertTrue("Pause " + (i + 1) + " must last at least " + pauses[i] + " ms: " + pause, pause >= pauses[i] - CLOCK_SLACK);
-        }
-
-        LogEvent fifth = events(Level.WARN, ISSUER_DOWN).get(4);
-
-        assertTrue("The retry must stay within the maximum pause plus jitter", plannedPause(fifth) <= maxPause + maxPause / 2);
-
-        assertEquals(8, issuer.calls.size());
-        assertEquals(6, logged(Level.WARN, "initiator=automatic renewal, reason=" + ISSUER_DOWN));
-        assertEquals(0, logged(Level.ERROR, ISSUER_DOWN));
-        assertEquals(0, metrics(g).<IntMetric>findMetric("ConsecutiveRenewalFailures").value());
-        assertTrue(chainNotAfter(g) > now + 30 * MINUTE);
-    }
-
-    /** A failure must be an error once the next attempt would come only after expiry, even with more than half of the window left. */
-    @Test
-    public void testFailureBeforeExpiringRetryLoggedAsError() throws Exception {
-        long now = System.currentTimeMillis();
-        long notBefore = now - HOUR;
-        long timeLeft = 2 * MINUTE;
-        long notAfter = now + timeLeft;
-        long window = timeLeft + timeLeft / 2;
-        long retryPause = 2 * timeLeft;
-
-        Issuer issuer = new Issuer(valid(notBefore, notAfter), failure());
-
-        issuer.setRenewBeforeFraction((double)window / (notAfter - notBefore));
-        pauses(retryPause, retryPause);
-
-        startNode(issuer);
-
-        assertTrue(waitForCondition(() -> logged(Level.ERROR, "initiator=automatic renewal, reason=" + ISSUER_DOWN) == 1, 30_000));
-    }
-
-    /** A certificate due for renewal as soon as it is issued must not make the node renew more often than allowed. */
-    @Test
-    public void testRenewalsNoMoreOftenThanMinPause() throws Exception {
-        long minPause = 300;
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        AtomicInteger issued = new AtomicInteger();
-
-        Callable<KeyStore> dueOnIssue = () -> {
-            // A second later each time: notAfter is rounded down to a second, and a renewal that does not move it is refused.
-            long notAfter = System.currentTimeMillis() + timeLeft + issued.incrementAndGet() * SECOND;
-
-            return ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter);
-        };
-
-        Issuer issuer = new Issuer(dueOnIssue);
-
-        pauses(minPause, minPause);
-
-        startNode(issuer);
-
-        assertTrue(waitForCondition(() -> automaticRenewals("transports=" + COMMUNICATION) >= 4, 30_000));
-        assertTrue("Every attempt must renew the certificate",
-            appender.events().stream().noneMatch(e -> e.getLevel().isMoreSpecificThan(Level.WARN)));
-
-        for (int i = 2; i < 5; i++) {
-            long pause = issuer.calls.get(i).time - issuer.calls.get(i - 1).time;
-
-            assertTrue("Renewals must be at least " + minPause + " ms apart: " + pause, pause >= minPause - CLOCK_SLACK);
-        }
-    }
-
-    /** A {@code renewBeforeFraction} out of range must be refused at once. */
-    @Test
-    public void testInvalidSettingsRefused() {
-        SslContextFactory factory = new SslContextFactory();
-
-        assertThrowsWithCause(() -> factory.setRenewBeforeFraction(1), IllegalArgumentException.class);
-        assertThrowsWithCause(() -> factory.setRenewBeforeFraction(0), IllegalArgumentException.class);
-    }
-
-    /** The client connector with a factory of its own must be renewed on its own. */
-    @Test
-    public void testClientConnectorRenewed() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-
-        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), fresh(HOUR));
-
-        IgniteEx g = startClientConnectorOn(issuer);
-
-        assertTrue(waitForCondition(() -> automaticRenewals("transports=" + CLIENT_CONNECTOR) == 1, 30_000));
-
-        SslContextProvider p = provider(g, CLIENT_CONNECTOR);
-
-        long renewedExpiry = SslCertificates.chainNotAfter(certificateChain(p));
-
-        assertTrue(renewedExpiry > now + 30 * MINUTE);
-        assertTrue(waitForCondition(() -> p.nextRenewalTime() > now + 30 * MINUTE, 10_000));
-
-        assertEquals("New connections must get the renewed certificate", renewedExpiry,
-            servedCertificate(probe(), g.context().clientListener().port()).getNotAfter().getTime());
-    }
-
-    /** Renewal must be off unless enabled: the node must not ask the factory again, plan a renewal or run the renewal thread. */
-    @Test
-    public void testRenewalOffByDefault() throws Exception {
-        assertFalse(new SslContextFactory().isRenewalEnabled());
-
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-
-        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter));
-
-        issuer.setRenewalEnabled(false);
-
-        IgniteEx g = startNode(issuer);
-
-        assertEquals("A certificate in the window must stay", 1, issuer.calls.size());
-        assertEquals(0, nextRenewalTime(g));
-        assertFalse(renewalThreadAlive(g.name()));
-        assertTrue(appender.events().isEmpty());
-    }
-
-    /** The node sums failures once per factory, and a recovery clears only that factory's contribution. */
-    @Test
-    public void testRenewalFailuresMetric() throws Exception {
-        try (IgniteEx g = startGrid(0)) {
-            assertEquals(0, metrics(g).<IntMetric>findMetric("ConsecutiveRenewalFailures").value());
-        }
-
-        long now = System.currentTimeMillis();
-
-        KeyStore inUse = ca.keyStoreWithPrivateKey(now - HOUR, now + HOUR);
-
-        Issuer nodeIssuer = new Issuer(() -> inUse, () -> inUse, fresh(2 * HOUR));
-        Issuer clientIssuer = new Issuer(() -> inUse, () -> inUse, () -> inUse, fresh(2 * HOUR));
-
-        nodeIssuer.setRenewalEnabled(false);
-        clientIssuer.setRenewalEnabled(false);
-
-        IgniteEx g = startGrid(0, cfg -> {
-            cfg.setSslContextFactory(nodeIssuer);
-            cfg.setClientConnectorConfiguration(new ClientConnectorConfiguration().setSslEnabled(true).setSslClientAuth(false)
-                .setUseIgniteSslContextFactory(false).setSslContextFactory(clientIssuer));
-        });
-
-        SslContextProvider node = provider(g);
-        SslContextProvider client = provider(g, CLIENT_CONNECTOR);
-
-        assertSame(node, provider(g, DISCOVERY));
-
-        for (ReadOnlyMetricRegistry reg : g.context().metric())
-            assertFalse("Transport aliases must not be registered: " + reg.name(), reg.name().startsWith("ssl."));
-
-        IntMetric failures = metrics(g).findMetric("ConsecutiveRenewalFailures");
-
-        assertEquals(0, failures.value());
-
-        assertNull(node.renew(node.context()));
-        assertEquals(1, failures.value());
-
-        assertNull(client.renew(client.context()));
-        assertNull(client.renew(client.context()));
-        assertEquals(3, failures.value());
-
-        assertNotNull(node.renew(node.context()));
-        assertEquals(2, failures.value());
-
-        assertNotNull(client.renew(client.context()));
-        assertEquals(0, failures.value());
-    }
-
-    /**
-     * When the factory returns the current certificate, renewal retries with increasing pauses, counts each unsuccessful attempt
-     * and logs one warning without a stack trace. Manual reload resets the pause and allows a new warning.
-     * Only the warning after reload must name all transports: the first may be logged before discovery is registered.
-     */
-    @Test
-    public void testWaitsForNewerCertificate() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-        long minPause = 100;
-        long fourthPause = minPause * 2 * 2 * 2;
-
-        pauses(minPause, 10 * minPause);
-
-        KeyStore inUse = ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter);
-
-        Issuer issuer = new Issuer(() -> inUse);
-
-        IgniteEx g = startNode(issuer);
-
-        assertTrue(waitForCondition(() -> provider(g).renewalFailures() >= 5, 30_000));
-
-        long grown = issuer.calls.get(5).time - issuer.calls.get(4).time;
-
-        assertTrue("The fifth attempt must follow three doublings of the initial pause: " + grown,
-            grown >= fourthPause - CLOCK_SLACK);
-
-        assertEquals(1, logged(Level.WARN, WAITING));
-        assertEquals(0, logged(Level.ERROR, WAITING));
-        assertTrue("The wait must be logged without a stack trace", appender.events().stream().allMatch(e -> e.getThrown() == null));
-
-        ReadOnlyMetricRegistry reg = metrics(g);
-
-        assertTrue(reg.<IntMetric>findMetric("ConsecutiveRenewalFailures").value() >= 5);
-        assertNull(provider(g).reloadOutcome().failureReason());
-
-        Iterator<Metric> metrics = reg.iterator();
-
-        assertEquals("ssl.ConsecutiveRenewalFailures", metrics.next().name());
-        assertFalse("Only the renewal problem counter must be exposed", metrics.hasNext());
-
-        reload(g);
-
-        assertTrue(waitForCondition(() -> logged(Level.WARN, WAITING) == 2, 30_000));
-
-        LogEvent afterReload = events(Level.WARN, WAITING).get(1);
-
-        assertContains(log, afterReload.getMessage().getFormattedMessage(), WAITING + " [" + NODE_TRANSPORTS);
-        assertTrue("The pause must reset to the initial pause plus jitter", plannedPause(afterReload) <= minPause + minPause / 2);
-    }
-
-    /**
-     * When no newer certificate is available, log an error once when less than half of the renewal window remains and once at
-     * expiry. Further attempts must not repeat these messages.
-     */
-    @Test
-    public void testWaitTurningLateLoggedAsErrorAtOnce() throws Exception {
-        long lifetime = 5 * MINUTE;
-        long timeLeft = 20 * SECOND;
-        long window = timeLeft + 2 * SECOND;
-        AtomicReference<KeyStore> inUse = new AtomicReference<>();
-
-        // Issued on the first request, so that the time left does not depend on how long the node takes to start.
-        Issuer issuer = new Issuer(() -> {
-            if (inUse.get() == null) {
-                long notAfter = System.currentTimeMillis() + timeLeft;
-
-                inUse.set(ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter));
-            }
-
-            return inUse.get();
-        });
-
-        issuer.setRenewBeforeFraction((double)window / lifetime);
-
-        startNode(issuer);
-
-        assertTrue(waitForCondition(() -> logged(Level.ERROR, WAITING + " and expire soon") == 1, 30_000));
-
-        int calls = issuer.calls.size();
-
-        assertTrue(waitForCondition(() -> issuer.calls.size() >= calls + 2, 30_000));
-
-        assertEquals(1, logged(Level.WARN, WAITING));
-        assertEquals(1, logged(Level.ERROR, WAITING));
-
-        assertTrue(waitForCondition(() -> logged(Level.ERROR, WAITING + ", though they have expired") == 1, 30_000));
-
-        int expiredCalls = issuer.calls.size();
-
-        assertTrue(waitForCondition(() -> issuer.calls.size() >= expiredCalls + 2, 30_000));
-
-        assertEquals(1, logged(Level.WARN, WAITING));
-        assertEquals(2, logged(Level.ERROR, WAITING));
-    }
-
-    /** A node that stops in the middle of a renewal attempt must interrupt it without recording or logging a failure. */
-    @Test
-    public void testStopDuringRenewalLogsNoFailure() throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-
-        CountDownLatch entered = new CountDownLatch(1);
-
-        Issuer issuer = new Issuer(fresh(HOUR), valid(notAfter - lifetime, notAfter), () -> {
-            entered.countDown();
-
-            Thread.sleep(Long.MAX_VALUE);
-
-            return null;
-        });
-
-        IgniteEx g = startNode(issuer);
-        SslContextProvider p = provider(g);
-
-        p.reload();
-
-        SslContextProvider.ReloadOutcome outcome = p.reloadOutcome();
-
-        assertTrue(outcome.successTime() > 0);
-        assertTrue(entered.await(30, TimeUnit.SECONDS));
-
-        stopGrid(0);
-
-        assertEquals(0, p.renewalFailures());
-        assertEquals(outcome, p.reloadOutcome());
-        assertTrue(appender.events().stream().noneMatch(e -> e.getLevel().isMoreSpecificThan(Level.WARN)));
-    }
-
-    /** A loader returning after interruption must not replace the context or change recorded reload and renewal results. */
-    @Test
-    public void testInterruptedRenewalReturnPreservesState() throws Exception {
-        long now = System.currentTimeMillis();
-        KeyStore original = ca.keyStoreWithPrivateKey("original", now - HOUR, now + HOUR);
-        KeyStore replacement = ca.keyStoreWithPrivateKey("replacement", now - MINUTE, now + 2 * HOUR);
-
-        for (KeyStore candidate : List.of(original, replacement)) {
-            Issuer issuer = new Issuer(() -> original, () -> original, () -> original, failure(), () -> {
-                Thread.currentThread().interrupt();
-
-                return candidate;
-            });
-            SslContextProvider p = new SslContextProvider(issuer);
-
-            p.reload();
-            assertNull(p.renew(p.context()));
-            GridTestUtils.assertThrows(log, p::reload, IgniteException.class, ISSUER_DOWN);
-
-            SSLContext inUse = p.context();
-            Map<String, List<X509Certificate>> chains = p.certificateChains();
-            SslContextProvider.ReloadOutcome outcome = p.reloadOutcome();
-            int failures = p.renewalFailures();
-
-            assertTrue(outcome.successTime() > 0);
-            assertEquals(1, outcome.failures());
-            assertEquals(1, failures);
-
-            IgniteInterruptedCheckedException err = null;
-            boolean interrupted;
-
-            try {
-                p.renew(inUse);
-            }
-            catch (IgniteInterruptedCheckedException e) {
-                err = e;
-            }
-            finally {
-                interrupted = Thread.interrupted();
-            }
-
-            assertTrue(interrupted);
-            assertSame(inUse, p.context());
-            assertEquals(chains, p.certificateChains());
-            assertEquals(outcome, p.reloadOutcome());
-            assertEquals(failures, p.renewalFailures());
-            assertNotNull(err);
-        }
-    }
-
-    /** Cached and expired unchanged chains stay in use and count as unsuccessful renewal attempts. */
-    @Test
-    public void testSameCertificatesUnchanged() throws Exception {
-        long now = System.currentTimeMillis();
-
-        SslBundle cached = TestCertificateAuthority.bundle(ca.keyStoreWithPrivateKey(), ca.trustStore());
-
-        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR)) {
-            @Override public SslBundle createSslBundle() {
-                return cached;
-            }
-        });
-
-        assertNull(p.renew(p.context()));
-        assertEquals(1, p.renewalFailures());
-
-        assertNull(p.renew(p.context()));
-        assertEquals(2, p.renewalFailures());
-        assertEquals(0, p.reloadOutcome().failures());
-
-        KeyStore expired = ca.keyStoreWithPrivateKey(now - 2 * HOUR, now - HOUR);
-
-        SslContextProvider expiredProvider = new SslContextProvider(new Issuer(() -> expired));
-
-        SSLContext expiredCtx = expiredProvider.context();
-
-        assertNull(expiredProvider.renew(expiredCtx));
-        assertSame(expiredCtx, expiredProvider.context());
-        assertEquals(1, expiredProvider.renewalFailures());
-    }
-
-    /** New metadata cannot make a reused SSL context serve a replacement certificate. */
-    @Test
-    public void testChangedMetadataCannotRenewCachedContext() throws Exception {
-        long now = System.currentTimeMillis();
-        SslBundle original = TestCertificateAuthority.bundle(ca.keyStoreWithPrivateKey(now - HOUR, now + HOUR), ca.trustStore());
-        SslBundle replacement = TestCertificateAuthority.bundle(ca.keyStoreWithPrivateKey(now - HOUR, now + 2 * HOUR), ca.trustStore());
-        AtomicReference<SslBundle> supplied = new AtomicReference<>(original);
-
-        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR)) {
-            @Override public SslBundle createSslBundle() {
-                return supplied.get();
-            }
-        });
-
-        supplied.set(new SslBundle(original.context(), replacement.certificateChains()));
-
-        assertRenewalRejected(p, "The SSL context factory returns the context in use");
-    }
-
-    /** Returning the same certificate and throwing both count until a renewal extends the chain's lifetime. */
-    @Test
-    public void testUnsuccessfulRenewalsCounted() throws Exception {
-        long now = System.currentTimeMillis();
-
-        KeyStore inUse = ca.keyStoreWithPrivateKey(now - HOUR, now + HOUR);
-
-        SslContextProvider p = new SslContextProvider(new Issuer(() -> inUse, () -> inUse, failure(), () -> inUse, fresh(2 * HOUR)));
-
-        assertNull(p.renew(p.context()));
-        assertEquals(1, p.renewalFailures());
-
-        GridTestUtils.assertThrows(log, () -> p.renew(p.context()), IgniteException.class, ISSUER_DOWN);
-
-        assertEquals(2, p.renewalFailures());
-        assertNull(p.renew(p.context()));
-        assertEquals(3, p.renewalFailures());
-        assertEquals(1, p.reloadOutcome().failures());
-
-        assertNotNull(p.renew(p.context()));
-        assertEquals(0, p.renewalFailures());
-    }
-
-    /** Manual reloads neither count as renewal attempts nor clear their failures unless the chain expires later. */
-    @Test
-    public void testReloadClearsRenewalFailuresOnlyWithLaterExpiry() throws Exception {
-        long now = System.currentTimeMillis();
-        long notBefore = now - HOUR;
-        long notAfter = now + HOUR;
-        String alias = "node";
-
-        KeyStore inUse = ca.keyStoreWithPrivateKey(alias, notBefore, notAfter);
-        AtomicReference<Callable<KeyStore>> keySupplier = new AtomicReference<>(() -> inUse);
-        Issuer issuer = new Issuer(() -> keySupplier.get().call());
-
-        SslContextProvider p = new SslContextProvider(issuer);
-
-        assertNull(p.renew(p.context()));
-        assertEquals(1, p.renewalFailures());
-
-        // A failed manual reload is not an automatic renewal attempt.
-        keySupplier.set(failure());
-
-        GridTestUtils.assertThrows(log, p::reload, IgniteException.class, ISSUER_DOWN);
-
-        assertEquals(1, p.renewalFailures());
-
-        // Reloading the same certificate clears the reload error, but not the renewal failures.
-        keySupplier.set(() -> inUse);
-
-        p.reload();
-
-        assertEquals(1, p.renewalFailures());
-        assertNull(p.reloadOutcome().failureReason());
-
-        TestCertificateAuthority other = new TestCertificateAuthority("otherca");
-
-        issuer.trust = TestCertificateAuthority.trustStore(ca, other);
-
-        // Updating only the trust store does not renew the certificate.
-        p.reload();
-
-        assertEquals(1, p.renewalFailures());
-
-        // A different certificate with the same expiry still does not extend the chain's lifetime.
-        KeyStore sameExpiry = ca.keyStoreWithPrivateKey(alias, notBefore, notAfter);
-
-        keySupplier.set(() -> sameExpiry);
-
-        p.reload();
-
-        assertFalse(inUse.getCertificate(alias).equals(certificate(p)));
-        assertEquals(1, p.renewalFailures());
-
-        // Only the final certificate extends the chain's lifetime.
-        keySupplier.set(() -> ca.keyStoreWithPrivateKey(notBefore, notAfter + HOUR));
-
-        p.reload();
-
-        assertEquals(0, p.renewalFailures());
-    }
-
-    /** Extending only the leaf does not clear failures when the authority still expires first. */
-    @Test
-    public void testLaterLeafExpiryDoesNotClearRenewalFailures() throws Exception {
+    public void testFailureLogLevelFollowsTimeLeft() throws Exception {
+        // X.509 keeps whole seconds.
         long now = System.currentTimeMillis() / SECOND * SECOND;
-        long notBefore = now - HOUR;
-        long authorityExpiry = now + HOUR;
-        long leafExpiry = authorityExpiry + HOUR;
-        long laterLeafExpiry = leafExpiry + HOUR;
 
-        ca = new TestCertificateAuthority("renewalca", notBefore - HOUR, authorityExpiry);
-
-        KeyStore inUse = ca.keyStoreWithPrivateKey(notBefore, leafExpiry);
-
-        SslContextProvider p = new SslContextProvider(new Issuer(() -> inUse, () -> inUse, valid(notBefore, laterLeafExpiry)));
-
-        assertEquals(authorityExpiry, SslCertificates.chainNotAfter(certificateChain(p)));
-
-        assertNull(p.renew(p.context()));
-
-        p.reload();
-
-        assertEquals(laterLeafExpiry, certificate(p).getNotAfter().getTime());
-        assertEquals(authorityExpiry, SslCertificates.chainNotAfter(certificateChain(p)));
-        assertEquals(1, p.renewalFailures());
+        assertFailureLogged("More than half of the window left",
+            ca.keyStoreWithPrivateKey("early", now - 100 * MINUTE, now + 20 * MINUTE), QUARTER, "WARN " + FAILED);
+        assertFailureLogged("Less than half of the window left",
+            ca.keyStoreWithPrivateKey("late", now - 110 * MINUTE, now + 10 * MINUTE), QUARTER, "ERROR " + FAILED + " and expire soon");
+        // 45 seconds left are more than half of the 72-second window, but less than the minute before the retry.
+        assertFailureLogged("Retry after expiry",
+            ca.keyStoreWithPrivateKey("short-window", now + 45 * SECOND - HOUR, now + 45 * SECOND), 0.02,
+            "ERROR " + FAILED + " and expire soon");
+        assertFailureLogged("Expired",
+            ca.keyStoreWithPrivateKey("expired", now - 2 * HOUR, now - HOUR), QUARTER, "ERROR " + FAILED + ", though they have expired");
     }
 
-    /** The file-based factory with renewal enabled must put in use the key store replaced on disk, with no command. */
+    /**
+     * While the factory returns the chains in use, renewal logs that once, as a warning without a stack trace, and again only when
+     * the lateness grows: the fifth retry pause of 16 minutes takes the next attempt past the expiry 16 minutes away, which is an
+     * error. The attempts run one after another, so the time left does not change.
+     */
     @Test
-    public void testReplacedKeyStoreFileRenewed() throws Exception {
+    public void testWaitLoggedOncePerLateness() throws Exception {
         long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
+        SslBundle inUse = bundle(ca.keyStoreWithPrivateKey("in-use", now - 104 * MINUTE, now + 16 * MINUTE), ca.trustStore());
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
 
-        Path keyStore = Files.createTempFile("ignite-ssl-renewal-", ".jks");
+        when(f.createSslBundle()).thenReturn(inUse);
 
-        try {
-            TestCertificateAuthority.save(ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter), keyStore);
+        SslContextProvider p = new SslContextProvider(f);
 
-            SslContextFactory factory = new SslContextFactory();
+        p.startRenewal(exec, renewalLog);
 
-            factory.setKeyStoreFilePath(keyStore.toString());
-            factory.setKeyStorePassword(TestCertificateAuthority.PWD);
-            factory.setKeyStoreType("JKS");
-            factory.setTrustManagers(TestCertificateAuthority.trustManagers(ca.trustStore()));
-            factory.setRenewalEnabled(true);
+        for (int i = 0; i < 8; i++)
+            exec.runNext();
 
-            IgniteEx g = startNode(factory);
-
-            assertTrue(waitForCondition(() -> logged(Level.WARN, WAITING) == 1, 30_000));
-
-            TestCertificateAuthority.save(ca.keyStoreWithPrivateKey(now, now + HOUR), keyStore);
-
-            assertTrue(waitForCondition(() -> automaticRenewals(NODE_TRANSPORTS) == 1, 30_000));
-            assertTrue(chainNotAfter(g) > now + 30 * MINUTE);
-        }
-        finally {
-            Files.delete(keyStore);
-        }
-    }
-
-    /** Automatic renewal without certificate metadata must stop the node from starting. */
-    @Test
-    public void testUnknownCertificateRefusedAtStart() {
-        Issuer issuer = new Issuer(fresh(HOUR));
-
-        issuer.metadata = false;
-
-        GridTestUtils.assertThrowsAnyCause(log, () -> startClientConnectorOn(issuer), IgniteException.class,
-            "The SSL context factory must provide a nonempty certificate chain for every private key");
-    }
-
-    /** Automatic renewal cannot start when the loaded store contains no private key. */
-    @Test
-    public void testKeyStoreWithoutKeyRefusedAtStart() {
-        Issuer issuer = new Issuer(SslRenewalTest::noKey);
-
-        GridTestUtils.assertThrowsAnyCause(log, () -> startClientConnectorOn(issuer), IgniteException.class,
-            "The new key material has no private key, so the node would present no certificate");
-    }
-
-    /** Renewal rejects a store without a private key and retains the context and chain in use. */
-    @Test
-    public void testKeyStoreWithoutKeyNotRenewed() {
-        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR), SslRenewalTest::noKey));
-
-        assertRenewalRejected(p, "The new key material has no private key, so the node would present no certificate");
-    }
-
-    /** With renewal disabled, missing certificate metadata must not schedule renewal or produce renewal log messages. */
-    @Test
-    public void testUnknownCertificateWithoutRenewal() throws Exception {
-        Issuer issuer = new Issuer(fresh(HOUR));
-
-        issuer.metadata = false;
-        issuer.setRenewalEnabled(false);
-
-        IgniteEx g = startClientConnectorOn(issuer);
-
-        SslContextProvider p = provider(g, CLIENT_CONNECTOR);
-
-        assertNull(p.certificateChains());
-        assertEquals(0, p.nextRenewalTime());
-        assertContains(log, status(g), "certificate metadata is unavailable");
-        assertContains(log, reload(g), ": reloaded " + CLIENT_CONNECTOR);
-        assertTrue(appender.events().isEmpty());
-    }
-
-    /** Known aliases with a missing secondary chain cannot start or replace an automatically renewed context. */
-    @Test
-    public void testMissingSecondaryChainRefused() throws Exception {
-        String completeAlias = "complete-key";
-        String incompleteAlias = "key-without-chain";
-        AtomicBoolean missing = new AtomicBoolean();
-        KeyStore keys = ca.keyStoreWithPrivateKey(completeAlias);
-
-        addKey(keys, ca.keyStoreWithPrivateKey(incompleteAlias), incompleteAlias);
-
-        Issuer issuer = new Issuer(() -> keys) {
-            @Override public SslBundle createSslBundle() {
-                SslBundle loaded = super.createSslBundle();
-
-                return missing.get() ? new SslBundle(loaded.context(),
-                    Map.of(completeAlias, loaded.certificateChains().get(completeAlias), incompleteAlias, List.of())) : loaded;
-            }
-        };
-        SslContextProvider p = new SslContextProvider(issuer);
-
-        missing.set(true);
-
-        String reason = "The private key has no X.509 certificate chain; remove the key or provide its X.509 certificate chain " +
-            "[alias=" + incompleteAlias + ']';
-
-        assertRenewalRejected(p, reason);
-
-        SslContextProvider incomplete = new SslContextProvider(issuer);
-        ScheduledThreadPoolExecutor exec = new ScheduledThreadPoolExecutor(1);
-
-        try {
-            GridTestUtils.assertThrows(log, () -> {
-                incomplete.startRenewal(exec, log);
-
-                return null;
-            }, IgniteException.class, reason);
-
-            assertEquals(0, incomplete.nextRenewalTime());
-        }
-        finally {
-            exec.shutdownNow();
-
-            assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
-        }
-    }
-
-    /** Renewal settings are fixed at registration; changing the factory must not let reload lose the chain used by renewal. */
-    @Test
-    public void testReloadCannotLoseMetadataWithRenewal() {
-        Issuer issuer = new Issuer(fresh(HOUR));
-        SslContextProvider p = new SslContextProvider(issuer);
-
-        issuer.setRenewalEnabled(false);
-        issuer.metadata = false;
-
-        SSLContext inUse = p.context();
-        Map<String, List<X509Certificate>> chains = p.certificateChains();
-        String reason = "The new SSL context must provide a nonempty certificate chain for every private key to renew automatically";
-
-        assertNotNull(chains);
-
-        GridTestUtils.assertThrows(log, () -> {
-            p.reload();
-
-            return null;
-        }, IgniteCheckedException.class, reason);
-
-        assertSame(inUse, p.context());
-        assertEquals(chains, p.certificateChains());
-
-        assertRenewalRejected(p, reason);
-    }
-
-    /** Copies one private key and its chain into the target store. */
-    private static void addKey(KeyStore target, KeyStore source, String alias) throws Exception {
-        target.setKeyEntry(alias, source.getKey(alias, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
-            source.getCertificateChain(alias));
-    }
-
-    /** @return Key store with no private key. */
-    private static KeyStore noKey() throws Exception {
-        KeyStore noKey = KeyStore.getInstance(KeyStore.getDefaultType());
-
-        noKey.load(null, null);
-
-        return noKey;
+        assertEquals(List.of("WARN " + WAITING, "ERROR " + WAITING + " and expire soon"), problems());
+        assertTrue(appender.events().stream().allMatch(e -> e.getThrown() == null));
     }
 
     /**
-     * @param factory SSL context factory of the client connector.
-     * @return Started node whose client connector runs on the factory and whose other transports run without SSL.
+     * A wait logged as expiring soon is logged again once the certificates have expired, and not after that. The certificate expires
+     * within 3 seconds, which the test waits for.
      */
-    private IgniteEx startClientConnectorOn(AbstractSslContextFactory factory) throws Exception {
-        return startGrid(getTestIgniteInstanceName(0), cfg -> cfg
-            .setClientConnectorConfiguration(new ClientConnectorConfiguration().setSslEnabled(true).setSslClientAuth(false)
-                .setUseIgniteSslContextFactory(false).setSslContextFactory(factory)));
+    @Test
+    public void testWaitLoggedAgainOnExpiry() throws Exception {
+        // X.509 keeps whole seconds. With 2 to 3 seconds left, the first attempt comes before expiry even on a slow machine.
+        long notAfter = (System.currentTimeMillis() / SECOND + 3) * SECOND;
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(f.createSslBundle()).thenReturn(bundle(ca.keyStoreWithPrivateKey("in-use", notAfter - 2 * HOUR, notAfter), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+        exec.runNext();
+
+        assertTrue(waitForCondition(() -> System.currentTimeMillis() >= notAfter, 10_000));
+
+        exec.runNext();
+        exec.runNext();
+
+        assertEquals(List.of("ERROR " + WAITING + " and expire soon", "ERROR " + WAITING + ", though they have expired"), problems());
     }
 
     /**
-     * @param factory SSL context factory of the node.
-     * @return Started node.
+     * @param fraction Share of the lifetime left when renewal starts.
+     * @return Factory mock with renewal enabled; tests script its bundles.
      */
-    private IgniteEx startNode(AbstractSslContextFactory factory) throws Exception {
-        return startNode(0, factory);
+    private static AbstractSslContextFactory renewingFactory(double fraction) {
+        AbstractSslContextFactory f = mock(AbstractSslContextFactory.class);
+
+        when(f.isRenewalEnabled()).thenReturn(true);
+        when(f.getRenewBeforeFraction()).thenReturn(fraction);
+
+        return f;
     }
 
     /**
-     * @param idx Node index.
-     * @param factory SSL context factory of the node.
-     * @return Started node.
+     * @param fraction Share of the lifetime left when renewal starts.
+     * @param keys Key store a provider starts on.
+     * @return Time of the first attempt that renewal plans for it.
      */
-    private IgniteEx startNode(int idx, AbstractSslContextFactory factory) throws Exception {
-        return startGrid(getTestIgniteInstanceName(idx), cfg -> cfg.setSslContextFactory(factory));
+    private long firstAttempt(double fraction, KeyStore keys) throws Exception {
+        AbstractSslContextFactory f = renewingFactory(fraction);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(f.createSslBundle()).thenReturn(bundle(keys, ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+
+        return p.nextRenewalTime();
     }
 
     /**
-     * @param source Key store to use on each request.
-     * @param trust Authorities the node accepts.
-     * @param renewal Whether the node renews automatically.
-     * @return Configured issuer.
-     */
-    private Issuer issuer(Callable<KeyStore> source, KeyStore trust, boolean renewal) {
-        Issuer issuer = new Issuer(source);
-
-        issuer.trust = trust;
-        issuer.setRenewalEnabled(renewal);
-
-        return issuer;
-    }
-
-    /**
-     * Rotates one node's certificate, then restarts each node to check that they load their current certificates and reconnect.
+     * Checks that renew fails with the reason, keeps the bundle in use, counts one more unsuccessful renewal and records the reason
+     * as the last reload failure, which status shows.
      *
-     * @param peerCa Authority of the peer whose certificate stays unchanged.
-     */
-    private void assertNodesReconnectAfterRotationAndRestart(TestCertificateAuthority peerCa) throws Exception {
-        long now = System.currentTimeMillis();
-        long lifetime = HOUR;
-        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
-        long timeLeft = 3 * window / 4;
-        long notAfter = now + timeLeft;
-
-        AtomicReference<KeyStore> keys = new AtomicReference<>(ca.keyStoreWithPrivateKey("node0", notAfter - lifetime, notAfter));
-        KeyStore peerKeys = peerCa.keyStoreWithPrivateKey("node1", now - MINUTE, now + HOUR);
-        Issuer issuer = issuer(keys::get, peerCa.trustStore(), true);
-        Issuer peerIssuer = issuer(() -> peerKeys, ca.trustStore(), false);
-
-        IgniteEx g0 = startNode(0, issuer);
-        IgniteEx g1 = startNode(1, peerIssuer);
-
-        X509Certificate peerCert = certificate(provider(g1));
-
-        assertFalse(certificate(provider(g0)).equals(peerCert));
-        assertComputeWorks(g0, g1);
-
-        String renewedAlias = "node0-new";
-        KeyStore replacement = ca.keyStoreWithPrivateKey(renewedAlias, now, now + 2 * HOUR);
-        X509Certificate renewed = (X509Certificate)replacement.getCertificate(renewedAlias);
-
-        keys.set(replacement);
-
-        assertTrue(waitForCondition(() -> renewed.equals(certificate(provider(g0))), 30_000));
-
-        assertEquals(renewed, certificate(provider(g0)));
-        assertEquals(peerCert, certificate(provider(g1)));
-        assertEquals(0, provider(g1).reloadOutcome().successTime());
-        assertEquals(renewed, servedCertificate(peerIssuer.createSslBundle().context(), discoveryPort(g0)));
-        assertEquals(peerCert, servedCertificate(issuer.createSslBundle().context(), discoveryPort(g1)));
-
-        assertComputeWorks(g0, g1);
-
-        stopGrid(1);
-
-        g1 = startNode(1, issuer(() -> peerKeys, ca.trustStore(), false));
-
-        assertEquals(renewed, certificate(provider(g0)));
-        assertEquals(peerCert, certificate(provider(g1)));
-        assertComputeWorks(g0, g1);
-
-        stopGrid(0);
-
-        IgniteEx restarted = startNode(0, issuer(keys::get, peerCa.trustStore(), true));
-
-        assertEquals(renewed, certificate(provider(restarted)));
-        assertEquals(renewed, servedCertificate(peerIssuer.createSslBundle().context(), discoveryPort(restarted)));
-        assertEquals(peerCert, certificate(provider(g1)));
-        assertComputeWorks(restarted, g1);
-    }
-
-    /** Runs a job from each node on its peer. */
-    private void assertComputeWorks(IgniteEx g0, IgniteEx g1) {
-        for (IgniteEx from : List.of(g0, g1)) {
-            IgniteEx to = from == g0 ? g1 : g0;
-
-            assertEquals((Integer)1, from.compute(from.cluster().forNodeId(to.localNode().id())).withTimeout(10_000).call(() -> 1));
-        }
-    }
-
-    /**
-     * @param notBefore Time the certificate becomes valid.
-     * @param notAfter Time it expires.
-     * @return Step that issues a certificate valid for that time.
-     */
-    private Callable<KeyStore> valid(long notBefore, long notAfter) {
-        return () -> ca.keyStoreWithPrivateKey(notBefore, notAfter);
-    }
-
-    /**
-     * @param lifetime Lifetime of the certificate.
-     * @return Step that issues a certificate valid from the moment it is issued.
-     */
-    private Callable<KeyStore> fresh(long lifetime) {
-        return () -> {
-            long now = System.currentTimeMillis();
-
-            return ca.keyStoreWithPrivateKey(now, now + lifetime);
-        };
-    }
-
-    /** @return Step that simulates an unreachable issuer. */
-    private static Callable<KeyStore> failure() {
-        return () -> {
-            throw new IgniteException(ISSUER_DOWN);
-        };
-    }
-
-    /** @return Context to connect to the nodes with; a new one each time, so that no session is resumed with an old certificate. */
-    private SSLContext probe() throws Exception {
-        return TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
-    }
-
-    /**
-     * @param min Pause after the first unsuccessful renewal attempt, in milliseconds.
-     * @param max Longest pause, in milliseconds.
-     */
-    private static void pauses(long min, long max) {
-        GridTestUtils.setFieldValue(SslRenewal.class, "minPause", min);
-        GridTestUtils.setFieldValue(SslRenewal.class, "maxPause", max);
-    }
-
-    /**
+     * @param desc Case, named in assertion messages.
      * @param p Provider.
-     * @param reason Reason the renewal must be rejected for.
+     * @param reason Expected part of the failure message.
      */
-    private static void assertRenewalRejected(SslContextProvider p, String reason) {
-        SSLContext inUse = p.context();
-        Map<String, List<X509Certificate>> chains = p.certificateChains();
+    private void assertRenewalRejected(String desc, SslContextProvider p, String reason) {
+        SslBundle inUse = p.bundle();
         int failures = p.renewalFailures();
 
-        GridTestUtils.assertThrows(log, () -> p.renew(inUse), IgniteCheckedException.class, reason);
+        GridTestUtils.assertThrows(log, () -> p.renew(inUse.context()), IgniteCheckedException.class, reason, desc + ": not refused");
 
-        assertSame(inUse, p.context());
-        assertEquals(chains, p.certificateChains());
-        assertEquals(failures + 1, p.renewalFailures());
+        Assert.assertSame(desc, inUse, p.bundle());
+        assertEquals(desc, failures + 1, p.renewalFailures());
+        assertTrue(desc, p.reloadOutcome().failureReason().contains(reason));
     }
 
     /**
-     * @param level Level.
-     * @param text Text the message contains.
-     * @return Number of renewal messages containing the text at the given level.
+     * Starts renewal on the key store, lets the factory fail the first attempt and checks how renewal logs the failure.
+     *
+     * @param desc Case, named in assertion messages.
+     * @param inUse Key store a provider starts on.
+     * @param fraction Share of the lifetime left when renewal starts.
+     * @param expected Level and message of the failure, without the details in brackets.
      */
-    private long logged(Level level, String text) {
-        return events(level, text).size();
+    private void assertFailureLogged(String desc, KeyStore inUse, double fraction, String expected) throws Exception {
+        AbstractSslContextFactory f = renewingFactory(fraction);
+        RecordingExecutor exec = new RecordingExecutor();
+
+        when(f.createSslBundle()).thenReturn(bundle(inUse, ca.trustStore())).thenThrow(new IgniteException(ISSUER_DOWN));
+
+        SslContextProvider p = new SslContextProvider(f);
+        int before = problems().size();
+
+        p.startRenewal(exec, renewalLog);
+        exec.runNext();
+        exec.runNext();
+
+        List<String> problems = problems();
+        LogEvent failure = appender.events().get(appender.events().size() - 1);
+
+        assertEquals(desc, List.of(expected), problems.subList(before, problems.size()));
+        assertNotNull(desc + ": stack trace", failure.getThrown());
     }
 
-    /**
-     * @param level Level.
-     * @param text Text the message contains.
-     * @return Renewal messages containing the text at the given level, in log order.
-     */
-    private List<LogEvent> events(Level level, String text) {
-        return appender.events().stream().filter(e -> e.getLevel() == level && e.getMessage().getFormattedMessage().contains(text))
-            .collect(Collectors.toList());
+    /** @return Warnings and errors renewal logged, in log order, each as its level and its message without the details in brackets. */
+    private List<String> problems() {
+        return appender.events().stream().filter(e -> e.getLevel().isMoreSpecificThan(Level.WARN))
+            .map(e -> e.getLevel() + " " + e.getMessage().getFormattedMessage().replaceFirst(" \\[.*", ""))
+            .toList();
     }
 
-    /**
-     * @param transports Transports as the log names them.
-     * @return How many times the renewals put new certificates in use.
-     */
-    private long automaticRenewals(String transports) {
-        return logged(Level.INFO, "TLS certificates reloaded [" + transports);
-    }
+    /** Records scheduled tasks instead of running them after their delays; a test runs them one at a time in its own thread. */
+    private static class RecordingExecutor extends ScheduledThreadPoolExecutor {
+        /** Scheduled tasks, in the order of scheduling. */
+        private final List<Task> tasks = new ArrayList<>();
 
-    /**
-     * @param e Event logged by an unsuccessful renewal attempt.
-     * @return Time from the event to the next attempt it planned, in milliseconds.
-     */
-    private static long plannedPause(LogEvent e) {
-        String msg = e.getMessage().getFormattedMessage();
-        int from = msg.indexOf("nextRenewal=") + "nextRenewal=".length();
-
-        return Instant.parse(msg.substring(from, msg.indexOf(']', from))).toEpochMilli() - e.getTimeMillis();
-    }
-
-    /**
-     * @param g Node.
-     * @return Start of the renewal window, calculated with the default renewal fraction.
-     */
-    private static long dueTime(IgniteEx g) {
-        long notBefore = certificate(provider(g)).getNotBefore().getTime();
-        long notAfter = chainNotAfter(g);
-
-        return notAfter - (long)((notAfter - notBefore) * DFLT_RENEW_BEFORE_FRACTION);
-    }
-
-    /** */
-    private static long nextRenewalTime(IgniteEx g) {
-        return provider(g).nextRenewalTime();
-    }
-
-    /** */
-    private static long chainNotAfter(IgniteEx g) {
-        return SslCertificates.chainNotAfter(certificateChain(provider(g)));
-    }
-
-    /** @return Sole chain used by a single-key test factory. */
-    private static List<X509Certificate> certificateChain(SslContextProvider provider) {
-        Map<String, List<X509Certificate>> chains = provider.certificateChains();
-
-        assertNotNull(chains);
-        assertEquals(1, chains.size());
-
-        return chains.values().iterator().next();
-    }
-
-    /** @return Leaf of the sole chain used by a single-key test factory. */
-    private static X509Certificate certificate(SslContextProvider provider) {
-        return certificateChain(provider).get(0);
-    }
-
-    /**
-     * @param g Node.
-     * @return SSL metrics of the node.
-     */
-    private static ReadOnlyMetricRegistry metrics(IgniteEx g) {
-        for (ReadOnlyMetricRegistry reg : g.context().metric()) {
-            if (reg.name().equals("ssl"))
-                return reg;
-        }
-
-        throw new AssertionError("SSL metrics are not registered");
-    }
-
-    /**
-     * @param g Node.
-     * @return SSL context provider used by communication.
-     */
-    private static SslContextProvider provider(IgniteEx g) {
-        return provider(g, COMMUNICATION);
-    }
-
-    /**
-     * @param g Node.
-     * @param transport Transport.
-     * @return SSL context provider used by the transport.
-     */
-    private static SslContextProvider provider(IgniteEx g, String transport) {
-        for (SslContextProvider p : g.context().sslContexts().providers()) {
-            if (p.transports().contains(transport))
-                return p;
-        }
-
-        throw new AssertionError("Nothing serves " + transport);
-    }
-
-    /**
-     * @param name Node name.
-     * @return Whether a renewal thread of the node is alive.
-     */
-    private static boolean renewalThreadAlive(String name) {
-        for (Thread t : Thread.getAllStackTraces().keySet()) {
-            if (t.isAlive() && t.getName().startsWith("ssl-renewal") && t.getName().contains(name))
-                return true;
-        }
-
-        return false;
-    }
-
-    /** One request to an issuer. */
-    private static class Call {
-        /** Time the request arrived, in milliseconds since the epoch. */
-        private final long time = System.currentTimeMillis();
-
-        /** Operation context attribute standing for the operator, as the request saw it. */
-        private final @Nullable String operator = OperationContext.get(OPERATOR);
-    }
-
-    /** Factory that answers each request the way the test scripted it, the last step repeated for the rest. */
-    private class Issuer extends AbstractSslContextFactory {
         /** */
-        @Serial
-        private static final long serialVersionUID = 0L;
-
-        /** Answers to the requests in order, the last one repeated for the rest. */
-        private final List<Callable<KeyStore>> steps;
-
-        /** Requests so far. */
-        private final List<Call> calls = new CopyOnWriteArrayList<>();
-
-        /** Trust store for new contexts, or {@code null} to trust only the default test authority. */
-        private volatile KeyStore trust;
-
-        /** Whether this factory supplies certificate metadata. */
-        private boolean metadata = true;
-
-        /** @param steps Answers to the requests in order, the last one repeated for the rest. */
-        @SafeVarargs
-        private Issuer(Callable<KeyStore>... steps) {
-            this.steps = List.of(steps);
-
-            setRenewalEnabled(true);
+        private RecordingExecutor() {
+            super(1);
         }
 
         /** {@inheritDoc} */
-        @Override protected void checkParameters() {
-            // No-op.
+        @Override public ScheduledFuture<?> schedule(Runnable cmd, long delay, TimeUnit unit) {
+            Task task = new Task(cmd, unit.toMillis(delay));
+
+            tasks.add(task);
+
+            return task;
+        }
+
+        /** Runs the pending task with the shortest delay, the first scheduled of equal ones. */
+        private void runNext() {
+            pending().stream().min(Comparator.comparingLong(t -> t.delay)).orElseThrow().run();
+        }
+
+        /** @return Tasks neither run nor cancelled, in the order of scheduling. */
+        private List<Task> pending() {
+            return tasks.stream().filter(t -> !t.isDone()).toList();
+        }
+
+        /** @return Last scheduled task. */
+        private Task last() {
+            return tasks.get(tasks.size() - 1);
+        }
+    }
+
+    /** Task that runs only when a test runs it. */
+    private static class Task extends FutureTask<Void> implements ScheduledFuture<Void> {
+        /** Delay requested at scheduling, in milliseconds. */
+        private final long delay;
+
+        /**
+         * @param cmd Command.
+         * @param delay Delay requested at scheduling, in milliseconds.
+         */
+        private Task(Runnable cmd, long delay) {
+            super(cmd, null);
+
+            this.delay = delay;
         }
 
         /** {@inheritDoc} */
-        @Override public SslBundle createSslBundle() {
-            SslBundle bundle = super.createSslBundle();
-
-            return metadata ? bundle : new SslBundle(bundle.context(), null);
+        @Override public long getDelay(TimeUnit unit) {
+            return unit.convert(delay, TimeUnit.MILLISECONDS);
         }
 
         /** {@inheritDoc} */
-        @Override protected KeyMaterial loadKeyMaterial() {
-            Callable<KeyStore> step = steps.get(Math.min(calls.size(), steps.size() - 1));
-
-            calls.add(new Call());
-
-            try {
-                return new KeyMaterial(step.call(), TestCertificateAuthority.PWD, KeyManagerFactory.getDefaultAlgorithm());
-            }
-            catch (IgniteException e) {
-                throw e;
-            }
-            catch (Exception e) {
-                throw new IgniteException(e);
-            }
-        }
-
-        /** {@inheritDoc} */
-        @Override protected TrustManager[] createTrustManagers() throws SSLException {
-            try {
-                return TestCertificateAuthority.trustManagers(trust != null ? trust : ca.trustStore());
-            }
-            catch (Exception e) {
-                throw new SSLException(e);
-            }
+        @Override public int compareTo(Delayed other) {
+            return Long.compare(delay, other.getDelay(TimeUnit.MILLISECONDS));
         }
     }
 }

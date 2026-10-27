@@ -122,7 +122,7 @@ class SslRenewal {
 
         window = (long)(lifetime * renewBeforeFraction);
 
-        long at = Math.max(chainNotAfter - window, Math.max(provider.reloadOutcome().successTime() + minPause, U.currentTimeMillis()));
+        long at = Math.max(chainNotAfter - window, Math.max(provider.reloadOutcome().successTime() + minPause, System.currentTimeMillis()));
 
         schedule(at, planned.context());
 
@@ -163,7 +163,7 @@ class SslRenewal {
         if (exec.isShutdown())
             return;
 
-        long now = U.currentTimeMillis();
+        long now = System.currentTimeMillis();
 
         pause = pause == 0 ? minPause : Math.min(pause * 2, maxPause);
 
@@ -205,7 +205,7 @@ class SslRenewal {
 
         nextRenewalTime = at;
 
-        next = submit(() -> attempt(planned), Math.max(0, at - U.currentTimeMillis()));
+        next = submit(() -> attempt(planned), Math.max(0, at - System.currentTimeMillis()));
     }
 
     /**
