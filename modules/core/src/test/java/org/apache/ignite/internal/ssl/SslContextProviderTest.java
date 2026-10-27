@@ -34,7 +34,6 @@ import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
 import org.apache.ignite.ssl.KeyMaterial;
 import org.apache.ignite.ssl.SslBundle;
-import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
@@ -72,56 +71,20 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         stopAllGrids();
     }
 
-    /** An existing create override still controls the context, including its cache. Reload must not silently bypass it. */
+    /** The node retains a bundle until reload and gets metadata even when the factory overrides only its store loader. */
     @Test
-    public void testLegacyCreateOverrideIsPreserved() throws Exception {
-        SSLContext cached = TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
-
-        ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey) {
-            @Override public SSLContext create() {
-                return cached;
-            }
-        };
-        SslContextProvider provider = new SslContextProvider(factory);
-
-        assertSame(cached, provider.context());
-        assertNull(provider.certificateChains());
-        GridTestUtils.assertThrows(log, provider::reload, IgniteCheckedException.class, "returns the context in use");
-        assertSame(cached, provider.context());
-        assertEquals(0, factory.calls);
-    }
-
-    /** An old file-factory subclass may supply its cached context without configuring any store paths. */
-    @Test
-    public void testLegacyPreloadedContextIsPreserved() throws Exception {
-        SSLContext prepared = TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
-        SslContextFactory factory = new SslContextFactory() {
-            {
-                sslCtx.set(prepared);
-            }
-        };
-        SslContextProvider provider = new SslContextProvider(factory);
-
-        assertSame(prepared, provider.context());
-        assertNull(provider.certificateChains());
-        GridTestUtils.assertThrows(log, provider::reload, IgniteCheckedException.class, "returns the context in use");
-        assertSame(prepared, provider.context());
-    }
-
-    /** A factory that overrides both methods opts into bundles, even if its old create method still caches. */
-    @Test
-    public void testBundleOverrideOptsIntoReload() throws Exception {
+    public void testNodeKeepsBundleUntilReload() throws Exception {
         ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey) {
             @Override public SSLContext create() {
                 throw new AssertionError("The node must use createSslBundle()");
             }
-
-            @Override public SslBundle createSslBundle() {
-                return super.createSslBundle();
-            }
         };
         SslContextProvider provider = new SslContextProvider(factory);
         SSLContext first = provider.context();
+
+        assertSame(first, provider.context());
+        assertNotNull(provider.certificateChains());
+        assertEquals(1, factory.calls);
 
         provider.reload();
 
@@ -509,13 +472,13 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         }
 
         /** {@inheritDoc} */
-        @Override public SslBundle createSslBundle() {
+        @Override protected KeyMaterial loadKeyMaterial() {
             Callable<KeyStore> step = steps.get(Math.min(calls++, steps.size() - 1));
 
             try {
                 KeyStore store = step.call();
 
-                return createSslBundle(new KeyMaterial(store, TestCertificateAuthority.PWD, DFLT_KEY_ALGORITHM));
+                return new KeyMaterial(store, TestCertificateAuthority.PWD, DFLT_KEY_ALGORITHM);
             }
             catch (IgniteException e) {
                 throw e;
