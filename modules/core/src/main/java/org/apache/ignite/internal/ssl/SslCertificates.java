@@ -79,7 +79,7 @@ public class SslCertificates {
         List<String> descriptions = new ArrayList<>();
 
         chains.forEach((alias, chain) -> descriptions.add("alias=" + alias + ", " +
-            (chain.isEmpty() ? "certificate chain is unavailable" : describe(chain.get(0)))));
+            (chain.isEmpty() ? "certificate chain is absent or is not X.509" : describe(chain.get(0)))));
 
         return String.join("; ", descriptions);
     }

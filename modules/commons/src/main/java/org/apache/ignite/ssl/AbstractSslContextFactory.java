@@ -109,8 +109,9 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * Checks the factory parameters, loads its key material once, and builds a fresh context with the certificate chains from
      * that material. The factory does not retain the result.
      * <p>
-     * The node uses this method at startup and for {@code control.sh --ssl reload}. Calls for the same factory on a node
-     * never overlap. A factory that fetches certificates remotely must bound each request and respond to thread interruption.
+     * The node uses this method at startup and for {@code control.sh --ssl reload}. A node never calls this method concurrently
+     * for one factory object. A factory shared by several nodes in one JVM, or also used by application code, must be thread-safe.
+     * A factory that fetches certificates remotely must bound each request and respond to thread interruption.
      *
      * @return Fresh context and the certificate metadata available to this factory.
      * @throws IgniteException If the context could not be created.
