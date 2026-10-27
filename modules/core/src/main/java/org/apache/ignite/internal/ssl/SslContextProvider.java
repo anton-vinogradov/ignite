@@ -23,13 +23,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
-import java.util.function.Supplier;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.SSLContext;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
 import org.apache.ignite.ssl.SslBundle;
-import org.apache.ignite.ssl.SslContextFactory;
 import org.jetbrains.annotations.Nullable;
 
 import static org.apache.ignite.internal.ssl.SslCertificates.describe;
@@ -41,9 +39,6 @@ public class SslContextProvider {
 
     /** */
     private final Set<String> transports = new ConcurrentSkipListSet<>();
-
-    /** Builds fresh bundles, or invokes an older factory through its original create method. */
-    private final Supplier<SslBundle> source;
 
     /** Context and certificate metadata in use. */
     private volatile SslBundle bundle;
@@ -58,8 +53,7 @@ public class SslContextProvider {
     SslContextProvider(Factory<SSLContext> factory) {
         this.factory = factory;
 
-        source = bundleSource(factory);
-        bundle = source.get();
+        bundle = createBundle();
         bundle.context().createSSLEngine();
 
         sharedCtx = new CurrentSslContext(this::context);
@@ -95,34 +89,9 @@ public class SslContextProvider {
         return bundle.certificateChains();
     }
 
-    /**
-     * Custom factories opt into bundles by overriding createSslBundle(). Older subclasses keep create(), including a context
-     * placed directly in the protected cache. A more specific create() override must not be bypassed either.
-     *
-     * @param factory Configured factory.
-     * @return Source that preserves the factory's most specific creation method.
-     * @deprecated When the legacy factory cache is removed, use createSslBundle() for every AbstractSslContextFactory.
-     */
-    @Deprecated
-    private static Supplier<SslBundle> bundleSource(Factory<SSLContext> factory) {
-        if (factory.getClass() == SslContextFactory.class)
-            return ((SslContextFactory)factory)::createSslBundle;
-
-        if (factory instanceof AbstractSslContextFactory f) {
-            try {
-                Class<?> createOwner = f.getClass().getMethod("create").getDeclaringClass();
-                Class<?> bundleOwner = f.getClass().getMethod("createSslBundle").getDeclaringClass();
-
-                if (bundleOwner != AbstractSslContextFactory.class && bundleOwner != SslContextFactory.class &&
-                    createOwner.isAssignableFrom(bundleOwner))
-                    return f::createSslBundle;
-            }
-            catch (NoSuchMethodException | SecurityException ignored) {
-                // Retain the original create() path when the creation methods cannot be inspected.
-            }
-        }
-
-        return () -> new SslBundle(factory.create(), null);
+    /** @return A new bundle, with unknown certificate metadata for factories that only return a context. */
+    private SslBundle createBundle() {
+        return factory instanceof AbstractSslContextFactory f ? f.createSslBundle() : new SslBundle(factory.create(), null);
     }
 
     /**
@@ -158,11 +127,11 @@ public class SslContextProvider {
     }
 
     /**
-     * @return Bundle built anew, or the context in use if an older factory caches it.
+     * @return Bundle built anew, or the context in use if a custom factory caches it.
      * @throws IgniteCheckedException If the loaded material is known to have no private key.
      */
     private SslBundle build() throws IgniteCheckedException {
-        SslBundle rebuilt = source.get();
+        SslBundle rebuilt = createBundle();
         Map<String, List<X509Certificate>> chains = rebuilt.certificateChains();
 
         if (chains != null && chains.isEmpty())
