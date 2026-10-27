@@ -21,6 +21,7 @@ import java.io.Serial;
 import java.security.KeyStore;
 import java.security.cert.X509Certificate;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLContext;
@@ -31,6 +32,9 @@ import org.apache.ignite.IgniteException;
 import org.apache.ignite.configuration.ClientConnectorConfiguration;
 import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
+import org.apache.ignite.ssl.KeyMaterial;
+import org.apache.ignite.ssl.SslBundle;
+import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
@@ -39,13 +43,13 @@ import org.junit.Test;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.CLIENT_CONNECTOR;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.COMMUNICATION;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.DISCOVERY;
+import static org.apache.ignite.ssl.SslContextFactory.DFLT_KEY_ALGORITHM;
 import static org.apache.ignite.ssl.SslTestUtils.discoveryPort;
 import static org.apache.ignite.ssl.SslTestUtils.reload;
 import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.GridTestUtils.assertThrowsWithCause;
-import static org.junit.Assert.assertArrayEquals;
 
 /** Tests manual reload validation and certificate sources that supply optional metadata. */
 public class SslContextProviderTest extends GridCommonAbstractTest {
@@ -68,21 +72,61 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         stopAllGrids();
     }
 
-    /** Changing a returned chain must not change the provider's certificate or chain. */
+    /** An existing create override still controls the context, including its cache. Reload must not silently bypass it. */
     @Test
-    public void testCertificateChainCannotChangeProvider() {
-        SslContextProvider p = new SslContextProvider(new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey));
+    public void testLegacyCreateOverrideIsPreserved() {
+        ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey) {
+            @Override public SSLContext create() {
+                return super.create();
+            }
+        };
+        SSLContext cached = factory.create();
+        SslContextProvider provider = new SslContextProvider(factory);
 
-        X509Certificate[] chain = p.certificateChain();
+        assertSame(cached, provider.context());
+        assertNull(provider.certificateChains());
+        GridTestUtils.assertThrows(log, provider::reload, IgniteCheckedException.class, "returns the context in use");
+        assertSame(cached, provider.context());
+        assertEquals(1, factory.calls);
+    }
 
-        assertNotNull(chain);
+    /** An old file-factory subclass may supply its cached context without configuring any store paths. */
+    @Test
+    public void testLegacyPreloadedContextIsPreserved() throws Exception {
+        SSLContext prepared = TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
+        SslContextFactory factory = new SslContextFactory() {
+            {
+                sslCtx.set(prepared);
+            }
+        };
+        SslContextProvider provider = new SslContextProvider(factory);
 
-        X509Certificate[] expected = chain.clone();
+        assertSame(prepared, provider.context());
+        assertNull(provider.certificateChains());
+        GridTestUtils.assertThrows(log, provider::reload, IgniteCheckedException.class, "returns the context in use");
+        assertSame(prepared, provider.context());
+    }
 
-        chain[0] = null;
+    /** A factory that overrides both methods opts into bundles, even if its old create method still caches. */
+    @Test
+    public void testBundleOverrideOptsIntoReload() throws Exception {
+        ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey) {
+            @Override public SSLContext create() {
+                throw new AssertionError("The node must use createSslBundle()");
+            }
 
-        assertSame(expected[0], p.certificate());
-        assertArrayEquals(expected, p.certificateChain());
+            @Override public SslBundle createSslBundle() {
+                return super.createSslBundle();
+            }
+        };
+        SslContextProvider provider = new SslContextProvider(factory);
+        SSLContext first = provider.context();
+
+        provider.reload();
+
+        assertNotSame(first, provider.context());
+        assertNotNull(provider.certificateChains());
+        assertEquals(2, factory.calls);
     }
 
     /** Nodes with different certificates from one authority keep communicating when only one node reloads. */
@@ -112,48 +156,51 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         IgniteEx g0 = startNode(0, factory);
         IgniteEx g1 = startNode(1, peerFactory);
 
-        X509Certificate peerCert = provider(g1).certificate();
+        X509Certificate peerCert = certificate(provider(g1));
 
-        assertEquals(provider(g0).certificate(), servedCertificate(peerFactory.createNew(), discoveryPort(g0)));
+        assertEquals(certificate(provider(g0)), servedCertificate(peerFactory.createSslBundle().context(), discoveryPort(g0)));
 
         keys.set(untrusted.keyStoreWithPrivateKey());
 
         assertContains(log, reload(g0), ": reloaded " + COMMUNICATION + ", " + DISCOVERY);
         assertTrue(provider(g0).reloadOutcome().successTime() > 0);
-        assertEquals("CN=" + untrustedCaName, provider(g0).certificate().getIssuerX500Principal().getName());
-        assertEquals(peerCert, provider(g1).certificate());
+        assertEquals("CN=" + untrustedCaName, certificate(provider(g0)).getIssuerX500Principal().getName());
+        assertEquals(peerCert, certificate(provider(g1)));
 
-        assertThrowsWithCause(() -> servedCertificate(peerFactory.createNew(), discoveryPort(g0)), SSLException.class);
+        assertThrowsWithCause(() -> servedCertificate(peerFactory.createSslBundle().context(), discoveryPort(g0)), SSLException.class);
     }
 
-    /** Commands reload a store with multiple private keys and report that its certificate metadata is unavailable. */
+    /** Commands report both private-key aliases before and after reloading a store with multiple keys. */
     @Test
-    public void testCommandsReportUnknownMetadataForMultipleKeys() throws Exception {
+    public void testCommandsReportEveryPrivateKey() throws Exception {
         ScriptedSslContextFactory factory = new ScriptedSslContextFactory(this::twoKeys);
 
         IgniteEx g = startClientConnectorOn(factory);
 
         SslContextProvider p = provider(g, CLIENT_CONNECTOR);
 
-        assertNull(p.certificateChain());
-        assertContains(log, status(g), "certificate metadata is unavailable");
-        assertContains(log, reload(g), ": reloaded " + CLIENT_CONNECTOR);
+        assertEquals(2, p.certificateChains().size());
+
+        for (String report : List.of(status(g), reload(g))) {
+            for (String alias : p.certificateChains().keySet())
+                assertContains(log, report, "alias=" + alias);
+        }
     }
 
     /** Replacing one key with several keys must not prevent manual reload. */
     @Test
-    public void testReloadCanLoseMetadata() throws Exception {
+    public void testReloadCanAddPrivateKeys() throws Exception {
         ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey, this::twoKeys);
 
         SslContextProvider p = new SslContextProvider(factory);
         SSLContext inUse = p.context();
 
-        assertNotNull(p.certificateChain());
+        assertEquals(1, p.certificateChains().size());
 
         p.reload();
 
         assertNotSame(inUse, p.context());
-        assertNull(p.certificateChain());
+        assertEquals(2, p.certificateChains().size());
         assertTrue(p.reloadOutcome().successTime() > 0);
         assertEquals(0, p.reloadOutcome().failures());
     }
@@ -176,7 +223,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         p.reload();
 
         SSLContext inUse = p.context();
-        X509Certificate[] chain = p.certificateChain();
+        Map<String, List<X509Certificate>> chains = p.certificateChains();
         long lastSuccess = p.reloadOutcome().successTime();
 
         assertTrue(lastSuccess > 0);
@@ -187,7 +234,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
             GridTestUtils.assertThrows(log, p::reload, IgniteException.class, failureReason);
 
             assertSame(inUse, p.context());
-            assertArrayEquals(chain, p.certificateChain());
+            assertEquals(chains, p.certificateChains());
             assertEquals(lastSuccess, p.reloadOutcome().successTime());
             assertEquals(failures, p.reloadOutcome().failures());
             assertTrue(p.reloadOutcome().failureTime() >= attemptStart);
@@ -196,11 +243,12 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
         long recoveryStart = System.currentTimeMillis();
 
-        X509Certificate recovered = p.reload();
+        SslBundle recovered = p.reload();
 
         assertNotSame(inUse, p.context());
-        assertEquals(recovered, p.certificate());
-        assertTrue(recovered.getNotAfter().after(chain[0].getNotAfter()));
+        assertSame(recovered.context(), p.context());
+        assertEquals(recovered.certificateChains(), p.certificateChains());
+        assertTrue(certificate(p).getNotAfter().after(chains.values().iterator().next().get(0).getNotAfter()));
         assertTrue(p.reloadOutcome().successTime() >= recoveryStart);
         assertEquals(0, p.reloadOutcome().failures());
         assertEquals(0, p.reloadOutcome().failureTime());
@@ -215,12 +263,12 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
             () -> ca.keyStoreWithPrivateKey("future", now + HOUR, now + 2 * HOUR));
         SslContextProvider p = new SslContextProvider(factory);
         SSLContext inUse = p.context();
-        X509Certificate[] chain = p.certificateChain();
+        Map<String, List<X509Certificate>> chains = p.certificateChains();
 
         GridTestUtils.assertThrows(log, p::reload, IgniteCheckedException.class, "The new certificate chain is not valid now");
 
         assertSame(inUse, p.context());
-        assertArrayEquals(chain, p.certificateChain());
+        assertEquals(chains, p.certificateChains());
         assertEquals(1, p.reloadOutcome().failures());
     }
 
@@ -236,13 +284,35 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
         SslContextProvider p = new SslContextProvider(new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey, () -> candidate));
         SSLContext inUse = p.context();
-        X509Certificate[] chain = p.certificateChain();
+        Map<String, List<X509Certificate>> chains = p.certificateChains();
 
         GridTestUtils.assertThrows(log, p::reload, IgniteCheckedException.class, "subject=CN=" + expiredCaName);
 
         assertSame(inUse, p.context());
-        assertArrayEquals(chain, p.certificateChain());
+        assertEquals(chains, p.certificateChains());
         assertEquals(1, p.reloadOutcome().failures());
+    }
+
+    /** A valid first key must not hide an expired certificate belonging to another key. */
+    @Test
+    public void testEveryPrivateKeyIsValidated() throws Exception {
+        long now = System.currentTimeMillis();
+        String validAlias = "a-valid";
+        String expiredAlias = "z-expired";
+        KeyStore keys = ca.keyStoreWithPrivateKey(validAlias);
+        KeyStore expired = ca.keyStoreWithPrivateKey(expiredAlias, now - 2 * HOUR, now - HOUR);
+
+        keys.setKeyEntry(expiredAlias, expired.getKey(expiredAlias, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
+            expired.getCertificateChain(expiredAlias));
+
+        SslContextProvider provider = new SslContextProvider(new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey, () -> keys));
+        SSLContext original = provider.context();
+        Map<String, List<X509Certificate>> originalChains = provider.certificateChains();
+
+        GridTestUtils.assertThrows(log, provider::reload, IgniteCheckedException.class, "alias=" + expiredAlias);
+
+        assertSame(original, provider.context());
+        assertEquals(originalChains, provider.certificateChains());
     }
 
     /** An unsupported protocol in a replacement context leaves the working context in use. */
@@ -261,7 +331,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         assertEquals(1, p.reloadOutcome().failures());
     }
 
-    /** @return Store with two valid private keys and therefore no single chain for certificate metadata. */
+    /** @return Store with two private keys, each with its own valid certificate chain. */
     private KeyStore twoKeys() throws Exception {
         String firstAlias = "first-key";
         String secondAlias = "second-key";
@@ -320,9 +390,9 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         IgniteEx g0 = startNode(0, factory);
         IgniteEx g1 = startNode(1, peerFactory);
 
-        X509Certificate peerCert = provider(g1).certificate();
+        X509Certificate peerCert = certificate(provider(g1));
 
-        assertFalse(provider(g0).certificate().equals(peerCert));
+        assertFalse(certificate(provider(g0)).equals(peerCert));
         assertComputeWorks(g0, g1);
 
         KeyStore replacement = ca.keyStoreWithPrivateKey();
@@ -332,11 +402,11 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
         assertContains(log, reload(g0), ": reloaded " + COMMUNICATION + ", " + DISCOVERY);
 
-        assertEquals(replacementCert, provider(g0).certificate());
-        assertEquals(peerCert, provider(g1).certificate());
+        assertEquals(replacementCert, certificate(provider(g0)));
+        assertEquals(peerCert, certificate(provider(g1)));
         assertEquals(0, provider(g1).reloadOutcome().successTime());
-        assertEquals(replacementCert, servedCertificate(peerFactory.createNew(), discoveryPort(g0)));
-        assertEquals(peerCert, servedCertificate(factory.createNew(), discoveryPort(g1)));
+        assertEquals(replacementCert, servedCertificate(peerFactory.createSslBundle().context(), discoveryPort(g0)));
+        assertEquals(peerCert, servedCertificate(factory.createSslBundle().context(), discoveryPort(g1)));
 
         assertComputeWorks(g0, g1);
 
@@ -344,17 +414,17 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
         g1 = startNode(1, factory(() -> peerKeys, ca.trustStore()));
 
-        assertEquals(replacementCert, provider(g0).certificate());
-        assertEquals(peerCert, provider(g1).certificate());
+        assertEquals(replacementCert, certificate(provider(g0)));
+        assertEquals(peerCert, certificate(provider(g1)));
         assertComputeWorks(g0, g1);
 
         stopGrid(0);
 
         IgniteEx restarted = startNode(0, factory(keys::get, peerCa.trustStore()));
 
-        assertEquals(replacementCert, provider(restarted).certificate());
-        assertEquals(replacementCert, servedCertificate(peerFactory.createNew(), discoveryPort(restarted)));
-        assertEquals(peerCert, provider(g1).certificate());
+        assertEquals(replacementCert, certificate(provider(restarted)));
+        assertEquals(replacementCert, servedCertificate(peerFactory.createSslBundle().context(), discoveryPort(restarted)));
+        assertEquals(peerCert, certificate(provider(g1)));
         assertComputeWorks(restarted, g1);
     }
 
@@ -401,6 +471,16 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         throw new AssertionError("Nothing serves " + transport);
     }
 
+    /** @return The sole leaf certificate of a provider used by a single-key test. */
+    private static X509Certificate certificate(SslContextProvider provider) {
+        Map<String, List<X509Certificate>> chains = provider.certificateChains();
+
+        assertNotNull(chains);
+        assertEquals(1, chains.size());
+
+        return chains.values().iterator().next().get(0);
+    }
+
     /** Factory that answers each request the way the test scripted it, the last step repeated for the rest. */
     private class ScriptedSslContextFactory extends AbstractSslContextFactory {
         /** */
@@ -428,19 +508,19 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         }
 
         /** {@inheritDoc} */
-        @Override protected KeyMaterial createKeyMaterial() throws SSLException {
+        @Override public SslBundle createSslBundle() {
             Callable<KeyStore> step = steps.get(Math.min(calls++, steps.size() - 1));
 
             try {
                 KeyStore store = step.call();
 
-                return KeyMaterial.fromKeyStore(TestCertificateAuthority.keyManagers(store), store);
+                return createSslBundle(new KeyMaterial(store, TestCertificateAuthority.PWD, DFLT_KEY_ALGORITHM));
             }
             catch (IgniteException e) {
                 throw e;
             }
             catch (Exception e) {
-                throw new SSLException(e);
+                throw new IgniteException(e);
             }
         }
 

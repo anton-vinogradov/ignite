@@ -18,12 +18,10 @@
 package org.apache.ignite.ssl;
 
 import java.security.KeyManagementException;
-import java.security.KeyStore;
-import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
-import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
-import java.util.Enumeration;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.KeyManager;
@@ -37,7 +35,7 @@ import org.jetbrains.annotations.Nullable;
 
 /**
  * Base SSL context factory that caches the result of the first successful {@link #create()} call.
- * Use {@link #createNew()} to build another context without changing the cached one.
+ * Use {@link #createSslBundle()} to load another context and its certificate chains without changing the cached context.
  */
 public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     /** */
@@ -129,9 +127,9 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     }
 
     /**
-     * Sets whether a node calls {@link #createNew()} before the certificate expires to pick up a new certificate.
+     * Sets whether a node calls {@link #createSslBundle()} before the certificates expire to pick up replacements.
      * A file-based factory rereads its files. It does not replace them.
-     * When enabled, the factory must provide certificate chain metadata or the node does not start. Disabled by default.
+     * When enabled, the factory must provide a nonempty X.509 chain for every private key or the node does not start. Disabled by default.
      * Set this before starting the node; changing it on a running node takes effect after a restart.
      *
      * @param renewalEnabled Whether renewal is enabled.
@@ -147,7 +145,8 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
 
     /**
      * Sets the share of the certificate lifetime left when a node starts to renew the certificate. The lifetime runs from the time
-     * the certificate becomes valid to the earliest expiry in its chain. The value must be greater than {@code 0} and less than
+     * the leaf certificate becomes valid to the earliest expiry in its chain. For several private keys, the chain with the earliest
+     * expiry determines renewal; ties use the earliest leaf validity start. The value must be greater than {@code 0} and less than
      * {@code 1}, otherwise this method throws {@link IllegalArgumentException}.
      * If not specified, {@link #DFLT_RENEW_BEFORE_FRACTION} is used.
      * Set this before starting the node; changing it on a running node takes effect after a restart.
@@ -161,16 +160,49 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     }
 
     /**
-     * Creates SSL context based on factory settings.
+     * Builds a fresh context and its certificate metadata without calling {@link #create()} or changing its cached context.
+     * The default implementation calls the legacy key-manager hook and leaves certificate metadata unknown. Subclasses that
+     * load a key store can override this method and call {@link #createSslBundle(KeyMaterial)} to include its certificate chains.
+     * <p>
+     * The node uses this method at startup, for {@code control.sh --ssl reload} and for automatic renewal when a custom factory
+     * overrides it.
+     * Older subclasses keep the {@link #create()} path. Calls for the same factory on a node never overlap. A factory that
+     * fetches certificates remotely must bound each request and respond to thread interruption.
      *
-     * @return Initialized SSL context.
-     * @throws SSLException If SSL context could not be created.
+     * @return Fresh context and the certificate metadata available to this factory.
+     * @throws IgniteException If the context could not be created.
      */
-    private SSLContext createSslContext() throws SSLException {
-        checkParameters();
+    public SslBundle createSslBundle() {
+        try {
+            checkParameters();
 
-        KeyMaterial material = createKeyMaterial();
+            return createSslBundle(createKeyManagers(), null);
+        }
+        catch (SSLException e) {
+            throw new IgniteException(e);
+        }
+    }
 
+    /**
+     * Builds a fresh context from one loaded store. The caller must check its parameters before loading the material.
+     * This method does not call {@link #createKeyManagers()} or change the context cached by {@link #create()}.
+     *
+     * @param material Loaded key store, key password and manager algorithm.
+     * @return Context and certificate chains from that material.
+     * @throws SSLException If key managers, certificate metadata or the context cannot be created.
+     */
+    protected SslBundle createSslBundle(KeyMaterial material) throws SSLException {
+        return createSslBundle(material.keyManagers(), material.certificateChains());
+    }
+
+    /**
+     * @param keyMgrs Key managers, or {@code null} to use the provider's defaults.
+     * @param chains Certificate chains by private-key alias, or {@code null} if unknown.
+     * @return Initialized context and its certificate metadata.
+     * @throws SSLException If trust managers or the context cannot be created.
+     */
+    private SslBundle createSslBundle(@Nullable KeyManager[] keyMgrs,
+        @Nullable Map<String, List<X509Certificate>> chains) throws SSLException {
         TrustManager[] trustMgrs = createTrustManagers();
 
         try {
@@ -188,12 +220,12 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
                     sslParameters.setProtocols(protocols);
             }
 
-            if (sslParameters != null || material.chain != null || material.privateKeyMissing)
-                ctx = new SSLContextWrapper(ctx, sslParameters, material.chain, material.privateKeyMissing);
+            if (sslParameters != null)
+                ctx = new SSLContextWrapper(ctx, sslParameters);
 
-            ctx.init(material.keyMgrs, trustMgrs, null);
+            ctx.init(keyMgrs, trustMgrs, null);
 
-            return ctx;
+            return new SslBundle(ctx, chains);
         }
         catch (NoSuchAlgorithmException e) {
             throw new SSLException("Unsupported SSL protocol: " + proto, e);
@@ -225,22 +257,11 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      *
      * @return Created key managers.
      * @throws SSLException If this method is not overridden or key managers cannot be created.
-     * @deprecated Override {@link #createKeyMaterial()} to return key managers with their certificate chain.
+     * @deprecated Override {@link #createSslBundle()} to return a context with its certificate chains.
      */
     @Deprecated
     protected KeyManager[] createKeyManagers() throws SSLException {
-        throw new SSLException("Subclass must override createKeyMaterial() or createKeyManagers()");
-    }
-
-    /**
-     * Creates key managers and their certificate metadata from the same load. New subclasses should override this method.
-     * The default adapts {@link #createKeyManagers()} for existing subclasses and leaves the certificate chain unknown.
-     *
-     * @return Loaded key material.
-     * @throws SSLException If the key material could not be loaded.
-     */
-    protected KeyMaterial createKeyMaterial() throws SSLException {
-        return new KeyMaterial(createKeyManagers(), null);
+        throw new SSLException("Subclass must override createSslBundle() or createKeyManagers()");
     }
 
     /**
@@ -254,130 +275,12 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         SSLContext ctx = sslCtx.get();
 
         if (ctx == null) {
-            try {
-                ctx = createSslContext();
+            ctx = createSslBundle().context();
 
-                if (!sslCtx.compareAndSet(null, ctx))
-                    ctx = sslCtx.get();
-            }
-            catch (SSLException e) {
-                throw new IgniteException(e);
-            }
+            if (!sslCtx.compareAndSet(null, ctx))
+                ctx = sslCtx.get();
         }
 
         return ctx;
-    }
-
-    /**
-     * Builds a new SSL context from the current factory settings without reading or replacing the context cached by
-     * {@link #create()}.
-     * <p>
-     * A subclass that builds its context in its own {@link #create()} must override this method too and build the context from
-     * the same sources. This implementation calls {@link #checkParameters()}, {@link #createKeyMaterial()} and
-     * {@link #createTrustManagers()}; it does not call {@link #create()}.
-     * <p>
-     * A subclass that only changes the key source can override {@link #createKeyMaterial()} instead. When building a context
-     * through another mechanism, attach its loaded certificate chain, if known, using
-     * {@link SSLContextWrapper#SSLContextWrapper(SSLContext, SSLParameters, X509Certificate[])}.
-     * <p>
-     * The node calls this method for {@code control.sh --ssl reload} and automatic certificate renewal. Calls for the same
-     * factory on a node never overlap; calls for different factories may run at the same time. Automatic renewal requires
-     * certificate chain metadata both at startup and on every reload.
-     * <p>
-     * A subclass that fetches certificates from a remote source must limit how long a call takes and stop when its thread is
-     * interrupted. When the node stops, it interrupts an automatic renewal in progress and waits for it to end.
-     *
-     * @return New initialized SSL context.
-     * @throws IgniteException If the context could not be created.
-     */
-    public SSLContext createNew() {
-        try {
-            return createSslContext();
-        }
-        catch (SSLException e) {
-            throw new IgniteException(e);
-        }
-    }
-
-    /** Key managers and the certificate chain loaded with them. */
-    protected static final class KeyMaterial {
-        /** */
-        private final KeyManager[] keyMgrs;
-
-        /** */
-        private final X509Certificate[] chain;
-
-        /** Whether the loaded store is known to contain no private key. */
-        private final boolean privateKeyMissing;
-
-        /**
-         * @param keyMgrs Key managers, or {@code null} to use the provider's defaults.
-         * @param chain Chain of the single private key, own certificate first, or {@code null} if unknown.
-         */
-        public KeyMaterial(@Nullable KeyManager[] keyMgrs, @Nullable X509Certificate[] chain) {
-            this(keyMgrs, chain, false);
-        }
-
-        /**
-         * @param keyMgrs Key managers.
-         * @param chain Certificate chain, if known.
-         * @param privateKeyMissing Whether the loaded store contains no private key.
-         */
-        private KeyMaterial(@Nullable KeyManager[] keyMgrs, @Nullable X509Certificate[] chain, boolean privateKeyMissing) {
-            this.keyMgrs = keyMgrs == null ? null : keyMgrs.clone();
-            this.chain = chain == null || chain.length == 0 ? null : chain.clone();
-            this.privateKeyMissing = privateKeyMissing;
-        }
-
-        /** @return Key managers, or {@code null} to use the provider's defaults. */
-        public @Nullable KeyManager[] keyManagers() {
-            return keyMgrs == null ? null : keyMgrs.clone();
-        }
-
-        /**
-         * Takes the chain from the store used to create the key managers. A store with one private key and an X.509 chain
-         * supplies that chain. More than one private key, or a chain containing a non-X.509 certificate, leaves the chain
-         * unknown. A store without a private key records that fact separately from an unknown chain. The node refuses such
-         * material during reload or renewal.
-         *
-         * @param keyMgrs Key managers initialized from the store.
-         * @param store Already loaded key store.
-         * @return Key managers and the chain of the single private key, if known.
-         * @throws KeyStoreException If the store cannot be read.
-         */
-        public static KeyMaterial fromKeyStore(KeyManager[] keyMgrs, KeyStore store) throws KeyStoreException {
-            String keyAlias = null;
-
-            for (Enumeration<String> aliases = store.aliases(); aliases.hasMoreElements(); ) {
-                String alias = aliases.nextElement();
-
-                if (!store.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class))
-                    continue;
-
-                if (keyAlias != null)
-                    return new KeyMaterial(keyMgrs, null);
-
-                keyAlias = alias;
-            }
-
-            if (keyAlias == null)
-                return new KeyMaterial(keyMgrs, null, true);
-
-            Certificate[] certs = store.getCertificateChain(keyAlias);
-
-            if (certs == null || certs.length == 0)
-                return new KeyMaterial(keyMgrs, null);
-
-            X509Certificate[] chain = new X509Certificate[certs.length];
-
-            for (int i = 0; i < certs.length; i++) {
-                if (!(certs[i] instanceof X509Certificate))
-                    return new KeyMaterial(keyMgrs, null);
-
-                chain[i] = (X509Certificate)certs[i];
-            }
-
-            return new KeyMaterial(keyMgrs, chain);
-        }
     }
 }

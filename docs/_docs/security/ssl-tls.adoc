@@ -62,7 +62,7 @@ tab:C#/.NET[]
 tab:C++[unsupported]
 --
 
-The keystore must contain the node's certificate and private key. For automatic renewal, keep exactly one private key and its X.509 chain in each store.
+The keystore must contain the node's certificate and private key. For automatic renewal, include the X.509 chain of every private key.
 
 The trust store defines which peer certificates the node accepts. Configure trust on all nodes and clients before replacing certificates.
 
@@ -255,10 +255,12 @@ For manual file replacement, use <<Upgrading Certificates>> and run reload after
 === Prepare Certificate Delivery
 
 The delivery system must make a valid replacement available before renewal is due. Ignite reads the files when renewal is due, not when they change.
-The replacement chain must expire later than the current chain. If a CA certificate expires first, replace it too.
+Renewal follows the first certificate to expire across all private-key chains, including CA certificates. If several chains expire together, the earliest renewal window applies.
+The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
-With `SslContextFactory`, keep exactly one private key and its X.509 certificate chain in each key store.
-A custom factory must supply the chain with each SSL context. Without it, a node with automatic renewal enabled cannot start because it cannot determine when renewal is due.
+With `SslContextFactory`, include the X.509 chain of every private key in the key store. A custom factory must supply all these chains with each context.
+Without complete chains, a node with automatic renewal enabled cannot start because it cannot determine when renewal is due.
+Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
 
 Nodes and applications must trust the replacement certificates before they are loaded. For a new CA, follow the stages in <<Upgrading Certificates>>.
 When renewal installs a replacement certificate, `SslContextFactory` also reloads its trust store. Keep the old CA in the trust store until every affected node and application has switched certificates. Otherwise, the renewed node cannot connect to nodes that still use certificates from the old CA. To apply a trust store change without replacing the certificate, run `control.sh --ssl reload`.
