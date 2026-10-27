@@ -18,6 +18,9 @@
 package org.apache.ignite.internal.ssl;
 
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import org.apache.ignite.internal.util.typedef.X;
 import org.jetbrains.annotations.Nullable;
 
@@ -32,7 +35,7 @@ public class SslCertificates {
      * @param chain Chain, own certificate first.
      * @return Earliest expiry in the chain, in milliseconds since the epoch.
      */
-    public static long chainNotAfter(X509Certificate[] chain) {
+    public static long chainNotAfter(Iterable<X509Certificate> chain) {
         long res = Long.MAX_VALUE;
 
         for (X509Certificate cert : chain)
@@ -46,7 +49,7 @@ public class SslCertificates {
      * @param time Time to check, in milliseconds since the epoch.
      * @return First certificate of the chain that is not valid at that time, {@code null} if all are.
      */
-    public static @Nullable X509Certificate invalidAt(X509Certificate[] chain, long time) {
+    public static @Nullable X509Certificate invalidAt(Iterable<X509Certificate> chain, long time) {
         for (X509Certificate cert : chain) {
             if (time < cert.getNotBefore().getTime() || time > cert.getNotAfter().getTime())
                 return cert;
@@ -63,6 +66,22 @@ public class SslCertificates {
         return cert == null ? "" : "subject=" + cert.getSubjectX500Principal() + ", issuer=" + cert.getIssuerX500Principal() +
             ", serial=" + cert.getSerialNumber().toString(16) + ", notBefore=" + cert.getNotBefore().toInstant() +
             ", notAfter=" + cert.getNotAfter().toInstant();
+    }
+
+    /**
+     * @param chains Chains by private-key alias, or {@code null} when metadata is unavailable.
+     * @return Description of every alias and its leaf certificate, or an empty string if the aliases are unknown.
+     */
+    public static String describeChains(@Nullable Map<String, List<X509Certificate>> chains) {
+        if (chains == null)
+            return "";
+
+        List<String> descriptions = new ArrayList<>();
+
+        chains.forEach((alias, chain) -> descriptions.add("alias=" + alias + ", " +
+            (chain.isEmpty() ? "certificate chain is unavailable" : describe(chain.get(0)))));
+
+        return String.join("; ", descriptions);
     }
 
     /**
