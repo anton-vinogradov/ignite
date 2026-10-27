@@ -173,7 +173,7 @@ For automatically delivered certificates, see <<Renewing Certificates Automatica
 |Store path, password, store type, protocols, cipher suites or other factory settings
 |Update the node configuration and restart the node. Reload uses the settings the node started with.
 |HTTP REST certificates configured directly in Jetty XML
-|Restart the node.
+|Restart the node. To support reload, first link:restapi#https-and-certificate-reload[move the TLS configuration to `httpSslFactory`].
 |Stores used by thin clients or JDBC and ODBC applications
 |Load them in the applications as described in <<1. Trust the New Certificates,stage 1 below>>. The node reload command does not update applications.
 |===
@@ -227,7 +227,7 @@ Load the updated stores in running applications:
 
 . Back up the node's key store. Replace the old certificate and private key with the new certificate, its chain and private key.
 . Run `control.sh --ssl reload`, then use `control.sh --ssl status` to check the certificate loaded on that node. The reload command runs on all nodes, even when you changed the files on only one.
-. Test new connections before replacing the next node's certificate. Use `control.sh --diagnostic connectivity` to check communication between nodes. Test the client connector and binary REST with new connections from your applications.
+. Test new connections before replacing the next node's certificate. Use `control.sh --diagnostic connectivity` to check communication between nodes. Test the client connector, binary REST, and HTTP REST with new connections from your applications.
 
 Before removing old trust, also replace any application client certificate that would no longer be trusted. This includes `control.sh` started with `--keystore`. Reload the application stores as described in stage 1.
 
