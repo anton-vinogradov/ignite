@@ -91,8 +91,8 @@ public class GridCommandHandlerSslReloadTest extends GridCommandHandlerAbstractT
         List<IgniteEx> nodes = List.of(startGrid(0), startGrid(1), startClientGrid(2));
 
         String replacement = "node02";
-        String replacementSubject = "CN=" + replacement;
-        String loaded = "loaded alias=" + replacement + ", subject=" + replacementSubject;
+        String replacementSubj = "CN=" + replacement;
+        String loaded = "loaded alias=" + replacement + ", subject=" + replacementSubj;
 
         place(replacement, keyStore);
 
@@ -102,7 +102,7 @@ public class GridCommandHandlerSslReloadTest extends GridCommandHandlerAbstractT
             assertContains(log, reloadOutput,
                 node(grid) + ": reloaded " + transports(grid) + "; " + loaded);
 
-        assertEquals(replacementSubject, servedSubject(nodes.get(0).localNode().attribute(ATTR_REST_TCP_PORT)));
+        assertEquals(replacementSubj, servedSubject(nodes.get(0).localNode().attribute(ATTR_REST_TCP_PORT)));
 
         String statusOutput = executeCommand(EXIT_CODE_OK, "--ssl", "status");
 
