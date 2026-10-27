@@ -23,6 +23,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import org.apache.ignite.IgniteException;
 import org.apache.ignite.internal.management.api.NoArg;
 import org.apache.ignite.internal.processors.task.GridInternal;
@@ -74,20 +75,34 @@ public class SslStatusTask extends AbstractSslTask {
             for (SslContextProvider provider : providers) {
                 lines.add(id + ": " + provider.transports());
 
-                X509Certificate[] chain = provider.certificateChain();
+                Map<String, List<X509Certificate>> chains = provider.certificateChains();
 
-                if (chain == null)
+                if (chains == null)
                     lines.add(DOUBLE_INDENT + "certificate metadata is unavailable");
+                else if (chains.isEmpty())
+                    lines.add(DOUBLE_INDENT + "no private keys");
                 else {
-                    long chainNotAfter = chainNotAfter(chain);
+                    for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
+                        List<X509Certificate> chain = entry.getValue();
+                        String alias = "alias=" + entry.getKey();
 
-                    lines.add(DOUBLE_INDENT + "loaded " + describe(chain[0]) +
-                        (chainNotAfter < chain[0].getNotAfter().getTime() ? ", chainNotAfter=" + Instant.ofEpochMilli(chainNotAfter) : ""));
+                        if (chain.isEmpty()) {
+                            lines.add(DOUBLE_INDENT + alias + ": certificate chain is unavailable");
 
-                    if (invalidAt(chain, System.currentTimeMillis()) != null) {
-                        invalid = true;
+                            continue;
+                        }
 
-                        lines.add(DOUBLE_INDENT + "PROBLEM: the loaded certificate is not valid now");
+                        X509Certificate leaf = chain.get(0);
+                        long chainNotAfter = chainNotAfter(chain);
+
+                        lines.add(DOUBLE_INDENT + "loaded " + alias + ", " + describe(leaf) +
+                            (chainNotAfter < leaf.getNotAfter().getTime() ? ", chainNotAfter=" + Instant.ofEpochMilli(chainNotAfter) : ""));
+
+                        if (invalidAt(chain, System.currentTimeMillis()) != null) {
+                            invalid = true;
+
+                            lines.add(DOUBLE_INDENT + "PROBLEM: the loaded certificate is not valid now [" + alias + ']');
+                        }
                     }
                 }
 

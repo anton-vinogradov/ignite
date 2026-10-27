@@ -20,6 +20,8 @@ package org.apache.ignite.internal.ssl;
 import java.security.cert.X509Certificate;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.SSLContext;
@@ -76,13 +78,19 @@ public class SslContextRegistry extends GridProcessorAdapter {
 
     /** @param provider Newly registered provider. */
     private void warnIfExpired(SslContextProvider provider) {
-        X509Certificate[] chain = provider.certificateChain();
-        X509Certificate invalid = chain == null ? null : SslCertificates.invalidAt(chain, System.currentTimeMillis());
+        Map<String, List<X509Certificate>> chains = provider.certificateChains();
 
-        if (invalid != null) {
-            U.warn(log, "The TLS certificate chain in use is not valid now on " +
-                provider.transports() + "; put a valid certificate in place and run control.sh --ssl reload [" +
-                SslCertificates.describe(invalid) + ']');
+        if (chains == null)
+            return;
+
+        for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
+            X509Certificate invalid = SslCertificates.invalidAt(entry.getValue(), System.currentTimeMillis());
+
+            if (invalid != null) {
+                U.warn(log, "The TLS certificate chain in use is not valid now on " + provider.transports() +
+                    "; put a valid certificate in place and run control.sh --ssl reload [alias=" + entry.getKey() + ", " +
+                    SslCertificates.describe(invalid) + ']');
+            }
         }
     }
 

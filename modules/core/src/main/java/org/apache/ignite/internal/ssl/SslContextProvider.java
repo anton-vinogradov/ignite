@@ -19,13 +19,17 @@ package org.apache.ignite.internal.ssl;
 
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.function.Supplier;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.SSLContext;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
-import org.apache.ignite.ssl.SSLContextWrapper;
+import org.apache.ignite.ssl.SslBundle;
+import org.apache.ignite.ssl.SslContextFactory;
 import org.jetbrains.annotations.Nullable;
 
 import static org.apache.ignite.internal.ssl.SslCertificates.describe;
@@ -38,8 +42,11 @@ public class SslContextProvider {
     /** */
     private final Set<String> transports = new ConcurrentSkipListSet<>();
 
-    /** Context in use. */
-    private volatile SSLContext ctx;
+    /** Builds fresh bundles, or invokes an older factory through its original create method. */
+    private final Supplier<SslBundle> source;
+
+    /** Context and certificate metadata in use. */
+    private volatile SslBundle bundle;
 
     /** Stable context handed to every transport using this factory. */
     private final SSLContext sharedCtx;
@@ -51,8 +58,9 @@ public class SslContextProvider {
     SslContextProvider(Factory<SSLContext> factory) {
         this.factory = factory;
 
-        ctx = factory.create();
-        ctx.createSSLEngine();
+        source = bundleSource(factory);
+        bundle = source.get();
+        bundle.context().createSSLEngine();
 
         sharedCtx = new CurrentSslContext(this::context);
     }
@@ -64,7 +72,7 @@ public class SslContextProvider {
 
     /** @return Context to open the next connection with. */
     SSLContext context() {
-        return ctx;
+        return bundle.context();
     }
 
     /** @return Stable context shared by every transport configured with this factory. */
@@ -82,16 +90,37 @@ public class SslContextProvider {
         return String.join(", ", transports);
     }
 
-    /** @return Chain loaded with the context in use, own certificate first, or {@code null} if it is unknown. */
-    public @Nullable X509Certificate[] certificateChain() {
-        return certificateChain(ctx);
+    /** @return Chains by private-key alias, or {@code null} when the factory supplies no metadata. */
+    public @Nullable Map<String, List<X509Certificate>> certificateChains() {
+        return bundle.certificateChains();
     }
 
-    /** @return Certificate loaded with the context in use, or {@code null} if it is unknown. */
-    public @Nullable X509Certificate certificate() {
-        X509Certificate[] chain = certificateChain(ctx);
+    /**
+     * Custom factories opt into bundles by overriding createSslBundle(). Older subclasses keep create(), including a context
+     * placed directly in the protected cache. A more specific create() override must not be bypassed either.
+     *
+     * @param factory Configured factory.
+     * @return Source that preserves the factory's most specific creation method.
+     */
+    private static Supplier<SslBundle> bundleSource(Factory<SSLContext> factory) {
+        if (factory.getClass() == SslContextFactory.class)
+            return ((SslContextFactory)factory)::createSslBundle;
 
-        return chain == null ? null : chain[0];
+        if (factory instanceof AbstractSslContextFactory f) {
+            try {
+                Class<?> createOwner = f.getClass().getMethod("create").getDeclaringClass();
+                Class<?> bundleOwner = f.getClass().getMethod("createSslBundle").getDeclaringClass();
+
+                if (bundleOwner != AbstractSslContextFactory.class && bundleOwner != SslContextFactory.class &&
+                    createOwner.isAssignableFrom(bundleOwner))
+                    return f::createSslBundle;
+            }
+            catch (NoSuchMethodException | SecurityException ignored) {
+                // Retain the original create() path when the creation methods cannot be inspected.
+            }
+        }
+
+        return () -> new SslBundle(factory.create(), null);
     }
 
     /**
@@ -99,23 +128,21 @@ public class SslContextProvider {
      * private key. If a certificate chain is supplied, every certificate must be within its validity period.
      * The administrator must ensure that peers trust the new certificates and can connect with the new context.
      *
-     * @return Certificate installed by this reload, or {@code null} if its metadata is unavailable.
+     * @return Context and certificate metadata installed by this reload.
      * @throws IgniteCheckedException If the new context fails a check or the factory returns the context in use. On any failure,
      *      including a factory exception, the current context is retained.
      */
-    public synchronized @Nullable X509Certificate reload() throws IgniteCheckedException {
+    public synchronized SslBundle reload() throws IgniteCheckedException {
         try {
-            SSLContext rebuilt = build();
+            SslBundle rebuilt = build();
 
-            if (rebuilt == ctx)
+            if (rebuilt.context() == bundle.context())
                 throw new IgniteCheckedException("The SSL context factory returns the context in use, so the node gets no new " +
                     "certificates from it");
 
-            X509Certificate[] next = certificateChain(rebuilt);
+            check(rebuilt.certificateChains());
 
-            check(next);
-
-            ctx = rebuilt;
+            bundle = rebuilt;
         }
         catch (Throwable e) {
             onFailure(e);
@@ -125,44 +152,42 @@ public class SslContextProvider {
 
         onSuccess();
 
-        return certificate();
+        return bundle;
     }
 
     /**
-     * @param ctx Context just built by the factory.
-     * @return Chain supplied with that context, or {@code null} if the factory supplies no metadata.
+     * @return Bundle built anew, or the context in use if an older factory caches it.
+     * @throws IgniteCheckedException If the loaded material is known to have no private key.
      */
-    static @Nullable X509Certificate[] certificateChain(SSLContext ctx) {
-        return ctx instanceof SSLContextWrapper wrapper ? wrapper.getCertificateChain() : null;
-    }
+    private SslBundle build() throws IgniteCheckedException {
+        SslBundle rebuilt = source.get();
+        Map<String, List<X509Certificate>> chains = rebuilt.certificateChains();
 
-    /**
-     * @return Context built anew, or the one in use if the factory caches it.
-     * @throws IgniteCheckedException If the factory reports that the loaded material has no private key.
-     */
-    private SSLContext build() throws IgniteCheckedException {
-        SSLContext rebuilt = factory instanceof AbstractSslContextFactory f ? f.createNew() : factory.create();
-
-        if (rebuilt instanceof SSLContextWrapper wrapper && wrapper.isPrivateKeyMissing())
+        if (chains != null && chains.isEmpty())
             throw new IgniteCheckedException("The new key material has no private key, so the node would present no certificate");
 
-        rebuilt.createSSLEngine();
+        rebuilt.context().createSSLEngine();
 
         return rebuilt;
     }
 
     /**
-     * @param next Chain loaded with the new context, {@code null} if it is unknown.
+     * @param next Chains loaded with the new context, {@code null} if they are unknown.
      * @throws IgniteCheckedException If a certificate is outside its validity period.
      */
-    private void check(@Nullable X509Certificate[] next) throws IgniteCheckedException {
+    private void check(@Nullable Map<String, List<X509Certificate>> next) throws IgniteCheckedException {
+        if (next == null)
+            return;
+
         long now = System.currentTimeMillis();
 
-        X509Certificate invalid = next == null ? null : SslCertificates.invalidAt(next, now);
+        for (Map.Entry<String, List<X509Certificate>> entry : next.entrySet()) {
+            X509Certificate invalid = SslCertificates.invalidAt(entry.getValue(), now);
 
-        if (invalid != null) {
-            throw new IgniteCheckedException("The new certificate chain is not valid now [" + describe(invalid) + ", now=" +
-                Instant.ofEpochMilli(now) + ']');
+            if (invalid != null) {
+                throw new IgniteCheckedException("The new certificate chain is not valid now [alias=" + entry.getKey() + ", " +
+                    describe(invalid) + ", now=" + Instant.ofEpochMilli(now) + ']');
+            }
         }
     }
 
