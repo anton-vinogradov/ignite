@@ -87,7 +87,7 @@ public class SslStatusTask extends AbstractSslTask {
                         String alias = "alias=" + entry.getKey();
 
                         if (chain.isEmpty()) {
-                            lines.add(DOUBLE_INDENT + alias + ": certificate chain is unavailable");
+                            lines.add(DOUBLE_INDENT + alias + ": certificate chain is absent or is not X.509");
 
                             continue;
                         }

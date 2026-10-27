@@ -180,8 +180,12 @@ For automatically delivered certificates, see <<Renewing Certificates Automatica
 
 If `trustManagers` is configured on the factory, it controls trust instead of a trust store file. Reload keeps those managers. Follow their implementation's procedure to change which certificates they accept.
 
-When the factory supplies certificate chains, reload checks every chain and rejects the replacement if any certificate is expired or not yet valid. The previous context stays in use. Without metadata, reload cannot check certificate dates.
-With `SslContextFactory`, reload also rejects a key store that contains no private key. Put the certificate and its private key in the key store and run reload again.
+Reload checks the dates of the certificate chains supplied by the factory. If any certificate is expired or not yet valid, the replacement is rejected and the previous context stays in use.
+
+A custom factory can return a context without certificate information. Status then reports `certificate metadata is unavailable`, and reload cannot check certificate dates.
+
+With `SslContextFactory`, reload also rejects a store with no private keys or a private-key entry without a usable X.509 certificate chain. If there are no private keys, install the node's certificate chain and private key. If the error identifies an alias, add its missing X.509 chain or remove that unusable private-key entry, then run reload again.
+
 You must check that peers trust the replacement and that protocols, cipher suites and client authentication settings remain compatible. Reload does not test connections or undo a successful replacement if connections later fail.
 
 == Upgrading Certificates
@@ -254,9 +258,10 @@ For manual file replacement, use <<Upgrading Certificates>> and run reload after
 
 === Prepare Certificate Delivery
 
-The delivery system must make a valid replacement available before renewal is due. Ignite reads the files when renewal is due, not when they change.
+Renewal follows the first certificate to expire across all private-key chains, including CA certificates.
+For that chain, the renewal window is the fraction `renewBeforeFraction` of the time from its leaf certificate's start date to its earliest expiry. Ignite starts requesting replacements when this window opens; `control.sh --ssl status` shows the next attempt time. If several chains expire together, the earliest window applies.
 
-Renewal follows the first certificate to expire across all private-key chains, including CA certificates. If several chains expire together, the earliest renewal window applies.
+The delivery system must make a valid replacement available before the window opens. Ignite reads the files at each scheduled attempt, not when they change.
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
 With `SslContextFactory`, include the X.509 chain of every private key in the key store. A custom factory must supply all these chains with each context.
@@ -347,26 +352,28 @@ This section is for developers integrating a certificate source, such as a PKI s
 
 To support reload and automatic renewal with certificate status, extend link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html[AbstractSslContextFactory].
 Its `createSslBundle()` method builds a fresh link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/SslBundle.html[SslBundle] containing the initialized context and the certificate chains loaded with it, indexed by private-key alias.
-The `create()` method returns `createSslBundle().context()`: each call creates a new context, with no cache in the factory.
+The final `create()` method returns `createSslBundle().context()`: each call creates a new context, with no cache in the factory.
+Nodes call `createSslBundle()` directly; callers using `Factory<SSLContext>` obtain its context through `create()`.
 
 If the source provides a key store, override `loadKeyMaterial()` to return link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/KeyMaterial.html[KeyMaterial] containing that loaded store, its key password and key manager algorithm.
-The base factory builds the context and metadata from the same store load.
+The base factory builds the context and metadata from the same store load. Keep that store unchanged for as long as a context built from it is in use; load a new store to change certificates.
+To customize key-manager behavior, override `createKeyManagers(KeyMaterial)` and wrap the managers returned by `super.createKeyManagers(material)`. The managers and reported certificate chains must use the same loaded material.
 
 The bundle includes every private-key alias, even when the context can choose among several keys.
-An empty map reports that there are no private keys, so node reload rejects it.
+An empty map reports that there are no private keys. An empty list for an alias means its certificate chain is missing or contains a non-X.509 certificate. Node reload rejects both cases.
 
 With automatic renewal enabled, every private key must have a nonempty chain at startup and on each reload. Without renewal, metadata is optional.
 See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html#createSslBundle()[method contract] for call ordering, concurrent calls and remote request handling.
 
 === Migrating an Existing Factory
 
-The protected `sslCtx` cache and the no-argument `createKeyManagers()` hook have been removed. Update subclasses that use them and recompile before upgrading:
+The protected `sslCtx` cache and the no-argument `createKeyManagers()` hook have been removed, and `create()` is now final. Update affected subclasses and recompile before upgrading:
 
-* Replace `createKeyManagers()` overrides with `loadKeyMaterial()`, returning the loaded store and its settings instead of key managers.
-* If a custom `create()` override loads a store and constructs a context, move that loading into `loadKeyMaterial()` and use the base factory's bundle construction. The inherited `create()` adapter then uses the same implementation as node reload.
+* Move store loading from `createKeyManagers()` into `loadKeyMaterial()`, returning the loaded store and its settings. Move key-manager customization into `createKeyManagers(KeyMaterial)`.
+* Remove `create()` overrides. Move store loading into `loadKeyMaterial()`. If the override customizes an already built context, perform that customization in `createSslBundle()` after calling `super.createSslBundle()`, and retain its certificate chains in the returned bundle.
 * Move any context caching needed by an external caller into that caller. The node keeps the current bundle and replaces it on reload.
 
-A subclass that only overrides `SslContextFactory.loadKeyStore()` can keep that override; the inherited bundle method uses it.
+A subclass that only overrides `SslContextFactory.loadKeyStore()` can keep that override as long as it returns a loaded store, never `null`. For a client context without private keys, return an empty loaded store.
 
 If the source provides a ready-made `SSLContext` instead of a key store, use a plain `Factory<SSLContext>`.
 It can support manual reload by returning a fresh context on every call. Returning the context already in use makes reload fail.

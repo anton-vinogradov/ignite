@@ -1824,8 +1824,8 @@ Status does not test connections or verify that other nodes and clients trust th
 |A certificate in the loaded chain has expired or is not yet valid. Install a valid chain and run reload.
 |`certificate metadata is unavailable`
 |The factory did not supply metadata, so status cannot check certificate dates. Check them directly in the key store or other certificate source. For a custom factory, see link:security/ssl-tls#custom-ssl-context-factories[Custom SSL Context Factories].
-|`alias=...: certificate chain is unavailable`
-|The source has this private key but did not supply its X.509 chain. Check the chain in the certificate source.
+|`alias=...: certificate chain is absent or is not X.509`
+|This private-key entry has no usable X.509 certificate chain. Add its X.509 chain or remove the unusable private-key entry, then run reload. Reload rejects a replacement that still contains such an entry.
 |`no private keys`
 |The loaded source contains no private key. Install the node's certificate and private key, then run reload.
 |`no SSL context factory is configured`
