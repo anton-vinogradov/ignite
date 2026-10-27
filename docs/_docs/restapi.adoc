@@ -117,7 +117,7 @@ If you keep TLS configured directly in Jetty XML, configure client authenticatio
 
 . Remove `SslConnectionFactory` from the Jetty XML file. The connector must not configure its own TLS or use the PROXY protocol when `httpSslFactory` is set, otherwise the node will not start.
 . Configure an `org.apache.ignite.ssl.SslContextFactory` with the HTTP REST key store and trust store, and assign it to `httpSslFactory`.
-Keep only one private key in this key store because the factory cannot select a key by alias. Use the same password for the private key and the store.
+If Jetty selected a specific key alias, use a separate store containing only that key; the Ignite factory has no alias selector. Use the same password for the private keys and the store.
 . Copy the enabled protocols and cipher suites from the Jetty SSL context factory to the Ignite factory's `protocols` and `cipherSuites` properties. Without them, HTTP REST uses JVM defaults. Jetty's default cipher exclusions still apply.
 . If Jetty had `needClientAuth=true`, set `httpSslClientAuth=true`. Otherwise, the migrated connector will accept clients without a certificate.
 . Keep any `SecureRequestCustomizer` and its settings in the Jetty XML file. Set `sniHostCheck=false` only if clients use a host name or IP address not listed in the certificate.
