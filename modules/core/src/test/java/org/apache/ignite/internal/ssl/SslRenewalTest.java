@@ -67,17 +67,18 @@ import static org.mockito.Mockito.when;
 
 /**
  * Renewal without nodes: its settings, {@link SslContextProvider#renew(SSLContext)}, the count of unsuccessful renewals and the
- * scheduler. Renewal is off by default. renew installs all new chains, an expired certificate included, only if the earliest
- * expiry advances and the checks of reload pass; it refuses a cached context with new metadata, waits on the chains in use,
- * ignores a replaced context and changes nothing when interrupted. Reload keeps the metadata renewal needs, renewal needs chains
+ * scheduler. Renewal is off by default. renew installs all new chains, even in place of an expired certificate. Its refusals
+ * follow the order of the checks in the code: it applies the checks of reload, waits while the factory returns the chains in
+ * use, refuses a cached context with new metadata and refuses chains that do not advance the earliest expiry. It ignores a
+ * replaced context and changes nothing when interrupted. Reload keeps the metadata renewal needs, renewal needs chains
  * to start, and unsuccessful renewals count until the earliest expiry advances, by renewal or reload. The scheduler tries first
  * at the window of the earliest chain, then no sooner than a minute after a success, backs off on failures and logs each one,
  * replans on reload, drops an outdated attempt and runs without the operator context. The log names the installed certificate,
  * sets the level of a failure by the time left and reports a wait once per lateness, again on expiry. Tests enable renewal on
  * a factory mock and script its bundles; pauses are the production ones, a minute to an hour. Renewal plans and attempts in
  * tasks of an executor that records them with their delays and runs one only when a test calls {@code runNext()}. Only two
- * tests wait: the operator context test runs on the executor of a node and waits for its attempt, and the last test waits for
- * a certificate to expire. An appender on the logger of {@link SslRenewal} captures what renewal logs.
+ * tests wait: the operator context test runs on the kind of executor a node uses and waits for its attempt, and the last test
+ * waits for a certificate to expire. An appender on the logger of {@link SslRenewal} captures what renewal logs.
  */
 public class SslRenewalTest extends GridCommonAbstractTest {
     /** */
@@ -177,33 +178,6 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(Map.of("valid", chain(valid)), p.certificateChains());
     }
 
-    /**
-     * renew refuses new chains unless the earliest expiry across them, authorities included, is later than the one in use: here
-     * another key with the same expiry, one of two keys renewed, and a later leaf from an authority that expires no later.
-     */
-    @Test
-    public void testRenewalMustAdvanceEarliestExpiry() throws Exception {
-        long now = System.currentTimeMillis();
-        String reason = "The new certificate chains expire no later than the ones in use";
-        TestCertificateAuthority shortCa = new TestCertificateAuthority("short-ca", now - HOUR, now + HOUR);
-        KeyStore a = ca.keyStoreWithPrivateKey("a", now - HOUR, now + HOUR);
-        KeyStore b = ca.keyStoreWithPrivateKey("b", now - HOUR, now + HOUR);
-        KeyStore renewedA = ca.keyStoreWithPrivateKey("a", now - HOUR, now + 2 * HOUR);
-        AbstractSslContextFactory f = renewingFactory(QUARTER);
-
-        when(f.createSslBundle()).thenReturn(
-            bundle(merged(a, b), ca.trustStore()),
-            bundle(ca.keyStoreWithPrivateKey("other", now - HOUR, now + HOUR), ca.trustStore()),
-            bundle(merged(renewedA, b), ca.trustStore()),
-            bundle(shortCa.keyStoreWithPrivateKey("short-ca-leaf", now - HOUR, now + 2 * HOUR), ca.trustStore()));
-
-        SslContextProvider p = new SslContextProvider(f);
-
-        assertRenewalRejected("Another key with the same expiry", p, reason);
-        assertRenewalRejected("One of two keys renewed", p, reason);
-        assertRenewalRejected("A later leaf from an authority that expires no later", p, reason);
-    }
-
     /** renew applies the checks of reload: here a candidate without a private key and one that is not valid yet are refused. */
     @Test
     public void testRenewalAppliesReloadChecks() throws Exception {
@@ -219,19 +193,6 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         assertRenewalRejected("No private key", p, "The new key material has no private key, so the node would present no certificate");
         assertRenewalRejected("Not valid yet", p, "The new certificate chain is not valid now [alias=not-yet-valid, ");
-    }
-
-    /** New metadata cannot make the context in use, which a caching factory returns again, serve a renewed certificate. */
-    @Test
-    public void testChangedMetadataCannotRenewCachedContext() throws Exception {
-        long now = System.currentTimeMillis();
-        SslBundle startup = bundle(ca.keyStoreWithPrivateKey("startup", now - HOUR, now + HOUR), ca.trustStore());
-        KeyStore renewed = ca.keyStoreWithPrivateKey("renewed", now - HOUR, now + 2 * HOUR);
-        AbstractSslContextFactory f = renewingFactory(QUARTER);
-
-        when(f.createSslBundle()).thenReturn(startup, new SslBundle(startup.context(), Map.of("renewed", chain(renewed))));
-
-        assertRenewalRejected("Cached context", new SslContextProvider(f), "The SSL context factory returns the context in use");
     }
 
     /**
@@ -260,6 +221,46 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertNull("Expired chains", expiredProvider.renew(expiredProvider.context()));
         assertEquals("Expired chains", 1, expiredProvider.renewalFailures());
         assertEquals("Expired chains", new ReloadOutcome(0, 0, null, 0), expiredProvider.reloadOutcome());
+    }
+
+    /** New metadata cannot make the context in use, which a caching factory returns again, serve a renewed certificate. */
+    @Test
+    public void testChangedMetadataCannotRenewCachedContext() throws Exception {
+        long now = System.currentTimeMillis();
+        SslBundle startup = bundle(ca.keyStoreWithPrivateKey("startup", now - HOUR, now + HOUR), ca.trustStore());
+        KeyStore renewed = ca.keyStoreWithPrivateKey("renewed", now - HOUR, now + 2 * HOUR);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(startup, new SslBundle(startup.context(), Map.of("renewed", chain(renewed))));
+
+        assertRenewalRejected("Cached context", new SslContextProvider(f), "The SSL context factory returns the context in use");
+    }
+
+    /**
+     * renew refuses new chains unless the earliest expiry across them, authorities included, is later than the one in use: here
+     * another key with the same expiry, one of two keys renewed, and a later leaf from an authority that expires no later.
+     */
+    @Test
+    public void testRenewalMustAdvanceEarliestExpiry() throws Exception {
+        long now = System.currentTimeMillis();
+        String reason = "The new certificate chains expire no later than the ones in use";
+        TestCertificateAuthority shortCa = new TestCertificateAuthority("short-ca", now - HOUR, now + HOUR);
+        KeyStore a = ca.keyStoreWithPrivateKey("a", now - HOUR, now + HOUR);
+        KeyStore b = ca.keyStoreWithPrivateKey("b", now - HOUR, now + HOUR);
+        KeyStore renewedA = ca.keyStoreWithPrivateKey("a", now - HOUR, now + 2 * HOUR);
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(
+            bundle(merged(a, b), ca.trustStore()),
+            bundle(ca.keyStoreWithPrivateKey("other", now - HOUR, now + HOUR), ca.trustStore()),
+            bundle(merged(renewedA, b), ca.trustStore()),
+            bundle(shortCa.keyStoreWithPrivateKey("short-ca-leaf", now - HOUR, now + 2 * HOUR), ca.trustStore()));
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        assertRenewalRejected("Another key with the same expiry", p, reason);
+        assertRenewalRejected("One of two keys renewed", p, reason);
+        assertRenewalRejected("A later leaf from an authority that expires no later", p, reason);
     }
 
     /** renew planned for a context that a reload has replaced does not call the factory and changes nothing. */
@@ -613,8 +614,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     }
 
     /**
-     * An attempt runs without the operation context of whoever started renewal, here an operator, even on the executor of a node,
-     * which passes the context of a submitter to its tasks. The factory sees the operator when the provider is created under it.
+     * An attempt runs without the operation context of whoever started renewal, here an operator, even on the kind of executor a
+     * node uses, which passes the context of a submitter to its tasks. The factory sees the operator when the provider is created under it.
      */
     @Test
     public void testRenewalRunsWithoutOperatorContext() throws Exception {
@@ -681,7 +682,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
     /**
      * A failure is a warning while more than half of the window is left and an error once less is left, the retry a minute later
-     * comes after expiry or the certificates have expired. In each case the first failure is logged with its stack trace.
+     * comes after expiry or the certificates have expired. In each case the first failure is logged with its reason and stack trace.
      */
     @Test
     public void testFailureLogLevelFollowsTimeLeft() throws Exception {
@@ -829,6 +830,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         assertEquals(desc, List.of(expected), problems.subList(before, problems.size()));
         assertNotNull(desc + ": stack trace", failure.getThrown());
+        assertContains(log, failure.getMessage().getFormattedMessage(), ", initiator=automatic renewal, reason=" + ISSUER_DOWN + ", ");
     }
 
     /** @return Warnings and errors renewal logged, in log order, each as its level and its message without the details in brackets. */

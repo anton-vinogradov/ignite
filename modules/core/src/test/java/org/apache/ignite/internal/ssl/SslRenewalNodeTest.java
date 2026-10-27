@@ -59,7 +59,7 @@ import static org.apache.ignite.testframework.TestCertificateAuthority.save;
  * Renewal on a node: a factory without certificate metadata stops the node from starting with renewal; the node exposes the sum of
  * unsuccessful renewals of its factories as the only SSL metric; stopping the node interrupts an attempt without a failure and
  * stops the renewal thread; the file-based factory puts a replaced key store in use with no command. Nodes run
- * {@link SslContextFactory} on key store files of the test and trust the test authority. A node starting with renewal starts on
+ * {@link SslContextFactory} on key store files of the test and trust the test authority. Nodes that run renewal start on
  * a certificate with 10 of its 120 minutes left, inside the default window of 18 minutes, so the first attempt comes at once.
  */
 public class SslRenewalNodeTest extends GridCommonAbstractTest {

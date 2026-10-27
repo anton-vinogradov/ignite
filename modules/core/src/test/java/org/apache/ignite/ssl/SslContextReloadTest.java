@@ -277,7 +277,10 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         assertEquals(newCert, servedCertificate(probe, g.localNode().attribute(ATTR_REST_TCP_PORT)));
     }
 
-    /** A factory that fails, even with a linkage error, is logged and does not prevent reloading the other factories of the node. */
+    /**
+     * A factory that fails, even with a linkage error, is logged and does not prevent reloading the other factories of the node.
+     * The node factory is registered first, so the client connector line shows that reload goes on after a failure.
+     */
     @Test
     public void testFailingFactoryDoesNotSkipOthers() throws Exception {
         String name = getTestIgniteInstanceName(0);
@@ -304,8 +307,8 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         String res = reloadFailure(g);
 
         assertContains(log, res, node(g) + ": failed on " + COMMUNICATION + ", " + DISCOVERY +
-            " (Certificate provider class is unavailable)");
-        assertContains(log, res, node(g) + ": reloaded " + CLIENT_CONNECTOR + "; loaded alias=" + NEW_KEY + ", ");
+            " (Certificate provider class is unavailable)\n" +
+            node(g) + ": reloaded " + CLIENT_CONNECTOR + "; loaded alias=" + NEW_KEY + ", ");
         assertTrue(logged.check());
     }
 
