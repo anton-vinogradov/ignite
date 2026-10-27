@@ -177,12 +177,13 @@ public class SslContextProvider {
 
     /**
      * Installs a new bundle only if the earliest expiry across all its chains is later than the current earliest expiry.
-     * Returning the current chains counts as an unsuccessful attempt and leaves the bundle unchanged.
+     * Returning the current chains counts as an unsuccessful attempt and leaves the bundle unchanged. An interrupted attempt
+     * changes nothing and does not count as unsuccessful.
      *
      * @param expected Context the renewal was planned for.
      * @return Installed bundle, or {@code null} if its chains are unchanged or the planned context had already been replaced.
      * @throws IgniteCheckedException If any chain is unknown, fails the checks of {@link #reload()} or the earliest expiry
-     *      does not advance.
+     *      does not advance, or if the thread is interrupted by the time the factory returns; the interrupt flag then stays set.
      */
     synchronized @Nullable SslBundle renew(SSLContext expected) throws IgniteCheckedException {
         if (bundle.context() != expected)
