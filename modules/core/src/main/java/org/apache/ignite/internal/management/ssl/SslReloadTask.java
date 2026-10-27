@@ -32,7 +32,7 @@ import org.apache.ignite.internal.visor.VisorJob;
 import org.apache.ignite.lang.IgniteBiTuple;
 import org.apache.ignite.plugin.security.SecuritySubject;
 
-import static org.apache.ignite.internal.ssl.SslCertificates.describe;
+import static org.apache.ignite.internal.ssl.SslCertificates.describeChains;
 import static org.apache.ignite.internal.ssl.SslCertificates.reason;
 
 /** Reloads TLS certificates on every mapped node. */
@@ -86,7 +86,7 @@ public class SslReloadTask extends AbstractSslTask {
                 String transports = provider.transports();
 
                 try {
-                    String desc = describe(provider.reload());
+                    String desc = describeChains(provider.reload().certificateChains());
 
                     U.log(ignite.log(), "TLS certificates reloaded [transports=" + transports + (desc.isEmpty() ? "" : ", " + desc) +
                         ", initiator=" + initiator + ']');

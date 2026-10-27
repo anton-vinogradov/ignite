@@ -25,6 +25,7 @@ import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -37,6 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
@@ -54,6 +56,8 @@ import org.apache.ignite.spi.metric.IntMetric;
 import org.apache.ignite.spi.metric.Metric;
 import org.apache.ignite.spi.metric.ReadOnlyMetricRegistry;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
+import org.apache.ignite.ssl.KeyMaterial;
+import org.apache.ignite.ssl.SslBundle;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.MemorizingAppender;
@@ -75,7 +79,6 @@ import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.GridTestUtils.assertThrowsWithCause;
 import static org.apache.ignite.testframework.GridTestUtils.waitForCondition;
-import static org.junit.Assert.assertArrayEquals;
 
 /** Tests that a node renews the certificates of a factory with renewal enabled before they expire. */
 public class SslRenewalTest extends GridCommonAbstractTest {
@@ -193,6 +196,112 @@ public class SslRenewalTest extends GridCommonAbstractTest {
             waitForCondition(() -> nextRenewalTime(g) == due, 10_000));
     }
 
+    /** Every private key affects the renewal date; equal expiries use the earliest leaf validity start. */
+    @Test
+    public void testRenewalPlannedByEarliestKey() throws Exception {
+        long now = System.currentTimeMillis() / SECOND * SECOND;
+        long firstExpiry = now + 2 * HOUR;
+        long secondNotBefore = now - 2 * HOUR;
+        String firstAlias = "first";
+        String secondAlias = "second";
+
+        for (long secondExpiry : List.of(now + HOUR, firstExpiry)) {
+            KeyStore keys = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, firstExpiry);
+
+            addKey(keys, ca.keyStoreWithPrivateKey(secondAlias, secondNotBefore, secondExpiry), secondAlias);
+
+            Issuer issuer = new Issuer(() -> keys);
+            SslContextProvider p = new SslContextProvider(issuer);
+            ScheduledThreadPoolExecutor exec = new ScheduledThreadPoolExecutor(1);
+
+            try {
+                p.startRenewal(exec, log);
+
+                exec.submit(() -> {}).get(10, TimeUnit.SECONDS);
+
+                long expected = secondExpiry - (long)((secondExpiry - secondNotBefore) * DFLT_RENEW_BEFORE_FRACTION);
+
+                assertEquals(expected, p.nextRenewalTime());
+                assertEquals(2, p.certificateChains().size());
+                assertEquals(1, issuer.calls.size());
+            }
+            finally {
+                exec.shutdownNow();
+
+                assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    /** Rotation replaces all chains together and does not require old and new private-key aliases to match. */
+    @Test
+    public void testAllKeysRenewedTogether() throws Exception {
+        long now = System.currentTimeMillis() / SECOND * SECOND;
+        long originalExpiry = now + HOUR;
+        long replacementExpiry = now + 2 * HOUR;
+        String firstAlias = "first";
+        String secondAlias = "second";
+        String replacementAlias = "replacement";
+        String otherReplacementAlias = "other-replacement";
+
+        KeyStore original = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, originalExpiry);
+        KeyStore replacement = ca.keyStoreWithPrivateKey(replacementAlias, now - HOUR, replacementExpiry);
+
+        addKey(original, ca.keyStoreWithPrivateKey(secondAlias, now - HOUR, originalExpiry), secondAlias);
+        addKey(replacement, ca.keyStoreWithPrivateKey(otherReplacementAlias, now - HOUR, replacementExpiry), otherReplacementAlias);
+
+        SslContextProvider p = new SslContextProvider(new Issuer(() -> original, () -> original, () -> replacement));
+        SslBundle before = p.bundle();
+
+        assertNull(p.renew(before.context()));
+        assertEquals(1, p.renewalFailures());
+
+        SslBundle renewed = p.renew(before.context());
+
+        assertSame(renewed, p.bundle());
+        assertNotSame(before.context(), renewed.context());
+        assertEquals(2, renewed.certificateChains().size());
+        assertEquals(replacement.getCertificate(replacementAlias), renewed.certificateChains().get(replacementAlias).get(0));
+        assertEquals(replacement.getCertificate(otherReplacementAlias), renewed.certificateChains().get(otherReplacementAlias).get(0));
+        assertEquals(replacementExpiry, SslCertificates.chainNotAfter(SslContextProvider.renewalChain(renewed)));
+        assertEquals(0, p.renewalFailures());
+    }
+
+    /** A replacement cannot leave another key at the original earliest expiry. */
+    @Test
+    public void testPartialRotationDoesNotAdvanceEarliestExpiry() throws Exception {
+        long now = System.currentTimeMillis() / SECOND * SECOND;
+        long originalExpiry = now + HOUR;
+        String firstAlias = "first";
+        String unchangedAlias = "unchanged";
+        KeyStore unchanged = ca.keyStoreWithPrivateKey(unchangedAlias, now - HOUR, originalExpiry);
+        KeyStore original = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, originalExpiry);
+        KeyStore replacement = ca.keyStoreWithPrivateKey(firstAlias, now - HOUR, originalExpiry + HOUR);
+
+        addKey(original, unchanged, unchangedAlias);
+        addKey(replacement, unchanged, unchangedAlias);
+
+        SslContextProvider p = new SslContextProvider(new Issuer(() -> original, () -> replacement));
+
+        assertRenewalRejected(p, "The new certificate chains expire no later than the ones in use");
+    }
+
+    /** Every candidate chain must be valid even when another key has been renewed successfully. */
+    @Test
+    public void testInvalidSecondaryChainRejected() throws Exception {
+        long now = System.currentTimeMillis();
+        String validAlias = "first";
+        String invalidAlias = "second";
+        KeyStore original = ca.keyStoreWithPrivateKey(validAlias, now - HOUR, now + HOUR);
+        KeyStore replacement = ca.keyStoreWithPrivateKey(validAlias, now - HOUR, now + 2 * HOUR);
+
+        addKey(replacement, ca.keyStoreWithPrivateKey(invalidAlias, now + HOUR, now + 3 * HOUR), invalidAlias);
+
+        SslContextProvider p = new SslContextProvider(new Issuer(() -> original, () -> replacement));
+
+        assertRenewalRejected(p, "The new certificate chain is not valid now [alias=" + invalidAlias);
+    }
+
     /** With less than half of the window left, failures must be logged as errors and counted, and the status must show the next attempt. */
     @Test
     public void testLateFailureLoggedAsError() throws Exception {
@@ -228,7 +337,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         SslContextProvider p = new SslContextProvider(new Issuer(() -> startupKeys, () -> replacement));
 
-        assertRenewalRejected(p, "The new certificate chain expires no later than the one in use");
+        assertRenewalRejected(p, "The new certificate chains expire no later than the ones in use");
     }
 
     /** An automatic renewal preserves connections to a peer whose certificate and different authority stay unchanged. */
@@ -254,7 +363,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         issuer.trust = other.trustStore();
 
         assertNotNull(p.renew(p.context()));
-        assertEquals("CN=" + authorityName, p.certificate().getIssuerX500Principal().getName());
+        assertEquals("CN=" + authorityName, certificate(p).getIssuerX500Principal().getName());
     }
 
     /** A renewal logs the certificate it installed even if a manual reload replaces it before the log is written. */
@@ -275,8 +384,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         SslContextProvider p = new SslContextProvider(issuer) {
-            @Override X509Certificate renew(SSLContext expected) throws IgniteCheckedException {
-                X509Certificate renewed = super.renew(expected);
+            @Override SslBundle renew(SSLContext expected) throws IgniteCheckedException {
+                SslBundle renewed = super.renew(expected);
 
                 if (renewed != null)
                     super.reload();
@@ -293,9 +402,9 @@ public class SslRenewalTest extends GridCommonAbstractTest {
             p.startRenewal(exec, log.getLogger(SslRenewal.class));
 
             assertTrue(waitForCondition(() -> automaticRenewals("transports=" + COMMUNICATION) == 1, 10_000));
-            assertEquals("CN=" + manualName, p.certificate().getSubjectX500Principal().getName());
+            assertEquals("CN=" + manualName, certificate(p).getSubjectX500Principal().getName());
             assertEquals(1, logged(Level.INFO,
-                "TLS certificates reloaded [transports=" + COMMUNICATION + ", subject=CN=" + renewedName + ','));
+                "TLS certificates reloaded [transports=" + COMMUNICATION + ", alias=" + renewedName + ", subject=CN=" + renewedName + ','));
         }
         finally {
             exec.shutdownNow();
@@ -324,6 +433,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         Issuer issuer = new Issuer(() -> inUse);
 
+        SSLContext cached = issuer.create();
         SslContextProvider p = new SslContextProvider(issuer);
 
         SSLContext planned = p.context();
@@ -338,8 +448,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertNull(p.renew(planned));
         assertEquals(1, p.renewalFailures());
         assertSame(reloaded, p.context());
-        assertEquals("The superseded renewal must not ask for another certificate", 3, issuer.calls.size());
-        assertSame(planned, issuer.create());
+        assertEquals("The superseded renewal must not ask for another certificate", 4, issuer.calls.size());
+        assertSame(cached, issuer.create());
     }
 
     /** A reload during renewal planning prevents the outdated attempt from calling the factory or replacing the new context. */
@@ -377,7 +487,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
                 return outcome;
             }
 
-            @Override X509Certificate renew(SSLContext expected) throws IgniteCheckedException {
+            @Override SslBundle renew(SSLContext expected) throws IgniteCheckedException {
                 attemptStarted.countDown();
 
                 return super.renew(expected);
@@ -632,7 +742,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         SslContextProvider p = provider(g, CLIENT_CONNECTOR);
 
-        long renewedExpiry = SslCertificates.chainNotAfter(p.certificateChain());
+        long renewedExpiry = SslCertificates.chainNotAfter(certificateChain(p));
 
         assertTrue(renewedExpiry > now + 30 * MINUTE);
         assertTrue(waitForCondition(() -> p.nextRenewalTime() > now + 30 * MINUTE, 10_000));
@@ -873,7 +983,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
             GridTestUtils.assertThrows(log, p::reload, IgniteException.class, ISSUER_DOWN);
 
             SSLContext inUse = p.context();
-            X509Certificate[] chain = p.certificateChain();
+            Map<String, List<X509Certificate>> chains = p.certificateChains();
             SslContextProvider.ReloadOutcome outcome = p.reloadOutcome();
             int failures = p.renewalFailures();
 
@@ -896,7 +1006,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
             assertTrue(interrupted);
             assertSame(inUse, p.context());
-            assertArrayEquals(chain, p.certificateChain());
+            assertEquals(chains, p.certificateChains());
             assertEquals(outcome, p.reloadOutcome());
             assertEquals(failures, p.renewalFailures());
             assertNotNull(err);
@@ -908,9 +1018,13 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     public void testSameCertificatesUnchanged() throws Exception {
         long now = System.currentTimeMillis();
 
-        SSLContext cached = TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
+        SslBundle cached = TestCertificateAuthority.bundle(ca.keyStoreWithPrivateKey(), ca.trustStore());
 
-        SslContextProvider p = new SslContextProvider(() -> cached);
+        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR)) {
+            @Override public SslBundle createSslBundle() {
+                return cached;
+            }
+        });
 
         assertNull(p.renew(p.context()));
         assertEquals(1, p.renewalFailures());
@@ -928,6 +1042,25 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertNull(expiredProvider.renew(expiredCtx));
         assertSame(expiredCtx, expiredProvider.context());
         assertEquals(1, expiredProvider.renewalFailures());
+    }
+
+    /** New metadata cannot make a reused SSL context serve a replacement certificate. */
+    @Test
+    public void testChangedMetadataCannotRenewCachedContext() throws Exception {
+        long now = System.currentTimeMillis();
+        SslBundle original = TestCertificateAuthority.bundle(ca.keyStoreWithPrivateKey(now - HOUR, now + HOUR), ca.trustStore());
+        SslBundle replacement = TestCertificateAuthority.bundle(ca.keyStoreWithPrivateKey(now - HOUR, now + 2 * HOUR), ca.trustStore());
+        AtomicReference<SslBundle> supplied = new AtomicReference<>(original);
+
+        SslContextProvider p = new SslContextProvider(new Issuer(fresh(HOUR)) {
+            @Override public SslBundle createSslBundle() {
+                return supplied.get();
+            }
+        });
+
+        supplied.set(new SslBundle(original.context(), replacement.certificateChains()));
+
+        assertRenewalRejected(p, "The SSL context factory returns the context in use");
     }
 
     /** Returning the same certificate and throwing both count until a renewal extends the chain's lifetime. */
@@ -1001,7 +1134,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         p.reload();
 
-        assertFalse(inUse.getCertificate(alias).equals(p.certificate()));
+        assertFalse(inUse.getCertificate(alias).equals(certificate(p)));
         assertEquals(1, p.renewalFailures());
 
         // Only the final certificate extends the chain's lifetime.
@@ -1027,14 +1160,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         SslContextProvider p = new SslContextProvider(new Issuer(() -> inUse, () -> inUse, valid(notBefore, laterLeafExpiry)));
 
-        assertEquals(authorityExpiry, SslCertificates.chainNotAfter(p.certificateChain()));
+        assertEquals(authorityExpiry, SslCertificates.chainNotAfter(certificateChain(p)));
 
         assertNull(p.renew(p.context()));
 
         p.reload();
 
-        assertEquals(laterLeafExpiry, p.certificate().getNotAfter().getTime());
-        assertEquals(authorityExpiry, SslCertificates.chainNotAfter(p.certificateChain()));
+        assertEquals(laterLeafExpiry, certificate(p).getNotAfter().getTime());
+        assertEquals(authorityExpiry, SslCertificates.chainNotAfter(certificateChain(p)));
         assertEquals(1, p.renewalFailures());
     }
 
@@ -1083,7 +1216,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         issuer.setRenewalEnabled(true);
 
         GridTestUtils.assertThrowsAnyCause(log, () -> startClientConnectorOn(issuer), IgniteException.class,
-            "The SSL context factory provides no certificate chain");
+            "The SSL context factory must provide a nonempty certificate chain for every private key");
     }
 
     /** Renewal rejects a store without a private key and retains the context and chain in use. */
@@ -1097,37 +1230,82 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     /** With renewal disabled, missing certificate metadata must not schedule renewal or produce renewal log messages. */
     @Test
     public void testUnknownCertificateWithoutRenewal() throws Exception {
-        Issuer issuer = new Issuer(this::twoKeys);
+        Issuer issuer = new Issuer(fresh(HOUR));
 
+        issuer.metadata = false;
         issuer.setRenewalEnabled(false);
 
         IgniteEx g = startClientConnectorOn(issuer);
 
         SslContextProvider p = provider(g, CLIENT_CONNECTOR);
 
-        assertNull(p.certificateChain());
+        assertNull(p.certificateChains());
         assertEquals(0, p.nextRenewalTime());
         assertContains(log, status(g), "certificate metadata is unavailable");
         assertContains(log, reload(g), ": reloaded " + CLIENT_CONNECTOR);
         assertTrue(appender.events().isEmpty());
     }
 
+    /** Known aliases with a missing secondary chain cannot start or replace an automatically renewed context. */
+    @Test
+    public void testMissingSecondaryChainRefused() throws Exception {
+        String knownAlias = "known";
+        String unknownAlias = "unknown";
+        AtomicBoolean missing = new AtomicBoolean();
+        KeyStore keys = ca.keyStoreWithPrivateKey(knownAlias);
+
+        addKey(keys, ca.keyStoreWithPrivateKey(unknownAlias), unknownAlias);
+
+        Issuer issuer = new Issuer(() -> keys) {
+            @Override public SslBundle createSslBundle() {
+                SslBundle loaded = super.createSslBundle();
+
+                return missing.get() ? new SslBundle(loaded.context(),
+                    Map.of(knownAlias, loaded.certificateChains().get(knownAlias), unknownAlias, List.of())) : loaded;
+            }
+        };
+        SslContextProvider p = new SslContextProvider(issuer);
+
+        missing.set(true);
+
+        assertRenewalRejected(p, "The new SSL context must provide a nonempty certificate chain for every private key");
+
+        SslContextProvider incomplete = new SslContextProvider(issuer);
+        ScheduledThreadPoolExecutor exec = new ScheduledThreadPoolExecutor(1);
+
+        try {
+            GridTestUtils.assertThrows(log, () -> {
+                incomplete.startRenewal(exec, log);
+
+                return null;
+            }, IgniteException.class, "The SSL context factory must provide a nonempty certificate chain for every private key");
+
+            assertEquals(0, incomplete.nextRenewalTime());
+        }
+        finally {
+            exec.shutdownNow();
+
+            assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
     /** Renewal settings are fixed at registration; changing the factory must not let reload lose the chain used by renewal. */
     @Test
     public void testReloadCannotLoseMetadataWithRenewal() {
-        Issuer issuer = new Issuer(fresh(HOUR), this::twoKeys);
+        Issuer issuer = new Issuer(fresh(HOUR));
 
         issuer.setRenewalEnabled(true);
 
         SslContextProvider p = new SslContextProvider(issuer);
 
         issuer.setRenewalEnabled(false);
+        issuer.metadata = false;
 
         SSLContext inUse = p.context();
-        X509Certificate[] chain = p.certificateChain();
-        String reason = "The new SSL context provides no certificate chain, so it cannot be renewed automatically";
+        Map<String, List<X509Certificate>> chains = p.certificateChains();
+        String reason = "The new SSL context must provide a nonempty certificate chain for every private key to renew automatically";
 
-        assertNotNull(chain);
+        assertNotNull(chains);
 
         GridTestUtils.assertThrows(log, () -> {
             p.reload();
@@ -1136,22 +1314,15 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         }, IgniteCheckedException.class, reason);
 
         assertSame(inUse, p.context());
-        assertArrayEquals(chain, p.certificateChain());
+        assertEquals(chains, p.certificateChains());
 
         assertRenewalRejected(p, reason);
     }
 
-    /** @return Store with two valid private keys and therefore no single chain for renewal metadata. */
-    private KeyStore twoKeys() throws Exception {
-        String firstAlias = "first";
-        String otherAlias = "other";
-        KeyStore keys = ca.keyStoreWithPrivateKey(firstAlias);
-        KeyStore other = ca.keyStoreWithPrivateKey(otherAlias);
-
-        keys.setKeyEntry(otherAlias, other.getKey(otherAlias, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
-            other.getCertificateChain(otherAlias));
-
-        return keys;
+    /** Copies one private key and its chain into the target store. */
+    private static void addKey(KeyStore target, KeyStore source, String alias) throws Exception {
+        target.setKeyEntry(alias, source.getKey(alias, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
+            source.getCertificateChain(alias));
     }
 
     /** @return Key store with no private key. */
@@ -1227,9 +1398,9 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         IgniteEx g0 = startNode(0, issuer);
         IgniteEx g1 = startNode(1, peerIssuer);
 
-        X509Certificate peerCert = provider(g1).certificate();
+        X509Certificate peerCert = certificate(provider(g1));
 
-        assertFalse(provider(g0).certificate().equals(peerCert));
+        assertFalse(certificate(provider(g0)).equals(peerCert));
         assertComputeWorks(g0, g1);
 
         String renewedAlias = "node0-new";
@@ -1238,13 +1409,13 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         keys.set(replacement);
 
-        assertTrue(waitForCondition(() -> renewed.equals(provider(g0).certificate()), 30_000));
+        assertTrue(waitForCondition(() -> renewed.equals(certificate(provider(g0))), 30_000));
 
-        assertEquals(renewed, provider(g0).certificate());
-        assertEquals(peerCert, provider(g1).certificate());
+        assertEquals(renewed, certificate(provider(g0)));
+        assertEquals(peerCert, certificate(provider(g1)));
         assertEquals(0, provider(g1).reloadOutcome().successTime());
-        assertEquals(renewed, servedCertificate(peerIssuer.createNew(), discoveryPort(g0)));
-        assertEquals(peerCert, servedCertificate(issuer.createNew(), discoveryPort(g1)));
+        assertEquals(renewed, servedCertificate(peerIssuer.createSslBundle().context(), discoveryPort(g0)));
+        assertEquals(peerCert, servedCertificate(issuer.createSslBundle().context(), discoveryPort(g1)));
 
         assertComputeWorks(g0, g1);
 
@@ -1252,17 +1423,17 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         g1 = startNode(1, issuer(() -> peerKeys, ca.trustStore(), false));
 
-        assertEquals(renewed, provider(g0).certificate());
-        assertEquals(peerCert, provider(g1).certificate());
+        assertEquals(renewed, certificate(provider(g0)));
+        assertEquals(peerCert, certificate(provider(g1)));
         assertComputeWorks(g0, g1);
 
         stopGrid(0);
 
         IgniteEx restarted = startNode(0, issuer(keys::get, peerCa.trustStore(), true));
 
-        assertEquals(renewed, provider(restarted).certificate());
-        assertEquals(renewed, servedCertificate(peerIssuer.createNew(), discoveryPort(restarted)));
-        assertEquals(peerCert, provider(g1).certificate());
+        assertEquals(renewed, certificate(provider(restarted)));
+        assertEquals(renewed, servedCertificate(peerIssuer.createSslBundle().context(), discoveryPort(restarted)));
+        assertEquals(peerCert, certificate(provider(g1)));
         assertComputeWorks(restarted, g1);
     }
 
@@ -1323,13 +1494,13 @@ public class SslRenewalTest extends GridCommonAbstractTest {
      */
     private static void assertRenewalRejected(SslContextProvider p, String reason) {
         SSLContext inUse = p.context();
-        X509Certificate[] chain = p.certificateChain();
+        Map<String, List<X509Certificate>> chains = p.certificateChains();
         int failures = p.renewalFailures();
 
         GridTestUtils.assertThrows(log, () -> p.renew(inUse), IgniteCheckedException.class, reason);
 
         assertSame(inUse, p.context());
-        assertArrayEquals(chain, p.certificateChain());
+        assertEquals(chains, p.certificateChains());
         assertEquals(failures + 1, p.renewalFailures());
     }
 
@@ -1376,7 +1547,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
      * @return Start of the renewal window, calculated with the default renewal fraction.
      */
     private static long dueTime(IgniteEx g) {
-        long notBefore = provider(g).certificate().getNotBefore().getTime();
+        long notBefore = certificate(provider(g)).getNotBefore().getTime();
         long notAfter = chainNotAfter(g);
 
         return notAfter - (long)((notAfter - notBefore) * DFLT_RENEW_BEFORE_FRACTION);
@@ -1389,7 +1560,22 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
     /** */
     private static long chainNotAfter(IgniteEx g) {
-        return SslCertificates.chainNotAfter(provider(g).certificateChain());
+        return SslCertificates.chainNotAfter(certificateChain(provider(g)));
+    }
+
+    /** @return Sole chain used by a single-key test factory. */
+    private static List<X509Certificate> certificateChain(SslContextProvider provider) {
+        Map<String, List<X509Certificate>> chains = provider.certificateChains();
+
+        assertNotNull(chains);
+        assertEquals(1, chains.size());
+
+        return chains.values().iterator().next();
+    }
+
+    /** @return Leaf of the sole chain used by a single-key test factory. */
+    private static X509Certificate certificate(SslContextProvider provider) {
+        return certificateChain(provider).get(0);
     }
 
     /**
@@ -1464,6 +1650,9 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         /** Trust store for new contexts, or {@code null} to trust only the default test authority. */
         private volatile KeyStore trust;
 
+        /** Whether this factory supplies certificate metadata. */
+        private boolean metadata = true;
+
         /** @param steps Answers to the requests in order, the last one repeated for the rest. */
         @SafeVarargs
         private Issuer(Callable<KeyStore>... steps) {
@@ -1478,7 +1667,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         }
 
         /** {@inheritDoc} */
-        @Override protected KeyMaterial createKeyMaterial() throws SSLException {
+        @Override public SslBundle createSslBundle() {
             Callable<KeyStore> step = steps.get(Math.min(calls.size(), steps.size() - 1));
 
             calls.add(new Call());
@@ -1486,13 +1675,16 @@ public class SslRenewalTest extends GridCommonAbstractTest {
             try {
                 KeyStore store = step.call();
 
-                return KeyMaterial.fromKeyStore(TestCertificateAuthority.keyManagers(store), store);
+                SslBundle bundle = createSslBundle(new KeyMaterial(store, TestCertificateAuthority.PWD,
+                    KeyManagerFactory.getDefaultAlgorithm()));
+
+                return metadata ? bundle : new SslBundle(bundle.context(), null);
             }
             catch (IgniteException e) {
                 throw e;
             }
             catch (Exception e) {
-                throw new SSLException(e);
+                throw new IgniteException(e);
             }
         }
 

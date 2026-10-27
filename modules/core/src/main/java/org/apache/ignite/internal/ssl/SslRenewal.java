@@ -19,6 +19,7 @@ package org.apache.ignite.internal.ssl;
 
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -30,6 +31,7 @@ import org.apache.ignite.internal.thread.context.OperationContext;
 import org.apache.ignite.internal.thread.context.Scope;
 import org.apache.ignite.internal.util.typedef.internal.U;
 import org.apache.ignite.ssl.AbstractSslContextFactory;
+import org.apache.ignite.ssl.SslBundle;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -107,22 +109,22 @@ class SslRenewal {
         submit(this::plan, 0);
     }
 
-    /** Plans the next renewal from the current certificate chain's expiry. */
+    /** Plans renewal from the first chain to expire, with the earliest window breaking ties. */
     private void plan() {
         pause = waitLogTime = 0;
 
-        SSLContext planned = provider.context();
-        X509Certificate[] chain = SslContextProvider.certificateChain(planned);
+        SslBundle planned = provider.bundle();
+        List<X509Certificate> chain = SslContextProvider.renewalChain(planned);
 
         chainNotAfter = SslCertificates.chainNotAfter(chain);
 
-        long lifetime = Math.max(0, chainNotAfter - chain[0].getNotBefore().getTime());
+        long lifetime = Math.max(0, chainNotAfter - chain.get(0).getNotBefore().getTime());
 
         window = (long)(lifetime * renewBeforeFraction);
 
         long at = Math.max(chainNotAfter - window, Math.max(provider.reloadOutcome().successTime() + minPause, U.currentTimeMillis()));
 
-        schedule(at, planned);
+        schedule(at, planned.context());
 
         U.log(log, "TLS certificates will be renewed automatically [transports=" + provider.transports() +
             ", nextRenewal=" + Instant.ofEpochMilli(at) + ", chainNotAfter=" + Instant.ofEpochMilli(chainNotAfter) + ']');
@@ -135,11 +137,11 @@ class SslRenewal {
      */
     private void attempt(SSLContext planned) {
         try {
-            X509Certificate renewed = provider.renew(planned);
+            SslBundle renewed = provider.renew(planned);
 
             if (renewed != null) {
                 U.log(log, "TLS certificates reloaded [transports=" + provider.transports() + ", " +
-                    SslCertificates.describe(renewed) + ", initiator=" + INITIATOR + ']');
+                    SslCertificates.describeChains(renewed.certificateChains()) + ", initiator=" + INITIATOR + ']');
             }
             else if (provider.context() == planned)
                 retry(planned, null);
