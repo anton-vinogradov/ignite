@@ -16,6 +16,7 @@
  */
 package org.apache.ignite.internal.processors.rest.protocols.http.jetty;
 
+import org.apache.ignite.internal.ssl.JettySslContextRenewalTest;
 import org.junit.runner.RunWith;
 import org.junit.runners.Suite;
 
@@ -27,7 +28,8 @@ import org.junit.runners.Suite;
     RestProcessorAuthorizationTest.class,
     RestSetupSimpleTest.class,
     IgniteRestExtensionTest.class,
-    JettySslContextReloadTest.class
+    JettySslContextReloadTest.class,
+    JettySslContextRenewalTest.class
 })
 public class GridRestSuite {
 }
