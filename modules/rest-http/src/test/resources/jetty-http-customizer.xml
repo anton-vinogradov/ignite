@@ -17,15 +17,14 @@
   limitations under the License.
 -->
 
-<!DOCTYPE Configure PUBLIC "-//Jetty//Configure//EN" "http://www.eclipse.jetty.org/jetty/configure.dtd">
+<!DOCTYPE Configure PUBLIC "-//Jetty//Configure//EN" "http://www.eclipse.org/jetty/configure.dtd">
 
 <Configure id="Server" class="org.eclipse.jetty.server.Server">
     <New id="httpCfg" class="org.eclipse.jetty.server.HttpConfiguration">
         <Call name="addCustomizer">
             <Arg>
                 <New class="org.eclipse.jetty.server.SecureRequestCustomizer">
-                    <Set name="sniHostCheck">false</Set>
-                    <Set name="stsMaxAge">86400</Set>
+                    <Set name="sniHostCheck">true</Set>
                 </New>
             </Arg>
         </Call>
