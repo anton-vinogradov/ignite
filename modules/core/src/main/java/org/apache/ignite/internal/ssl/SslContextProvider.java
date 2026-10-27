@@ -143,7 +143,8 @@ public class SslContextProvider {
 
     /**
      * Builds and installs a new context for new connections, recording success or failure. Rejects key material known to have no
-     * private key or a key without an X.509 certificate chain. If a certificate chain is supplied, every certificate must be within its validity period.
+     * private key or a key without an X.509 certificate chain. If a certificate chain is supplied, every certificate must be within
+     * its validity period.
      * Certificate metadata is required when automatic renewal is enabled.
      * The administrator must ensure that peers trust the new certificates and can connect with the new context.
      *
