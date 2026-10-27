@@ -1666,17 +1666,19 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         /** {@inheritDoc} */
         @Override public SslBundle createSslBundle() {
+            SslBundle bundle = super.createSslBundle();
+
+            return metadata ? bundle : new SslBundle(bundle.context(), null);
+        }
+
+        /** {@inheritDoc} */
+        @Override protected KeyMaterial loadKeyMaterial() {
             Callable<KeyStore> step = steps.get(Math.min(calls.size(), steps.size() - 1));
 
             calls.add(new Call());
 
             try {
-                KeyStore store = step.call();
-
-                SslBundle bundle = createSslBundle(new KeyMaterial(store, TestCertificateAuthority.PWD,
-                    KeyManagerFactory.getDefaultAlgorithm()));
-
-                return metadata ? bundle : new SslBundle(bundle.context(), null);
+                return new KeyMaterial(step.call(), TestCertificateAuthority.PWD, KeyManagerFactory.getDefaultAlgorithm());
             }
             catch (IgniteException e) {
                 throw e;
