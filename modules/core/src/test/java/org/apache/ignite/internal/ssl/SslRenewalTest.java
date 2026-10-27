@@ -1143,8 +1143,9 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
     /** @return Store with two valid private keys and therefore no single chain for renewal metadata. */
     private KeyStore twoKeys() throws Exception {
+        String firstAlias = "first";
         String otherAlias = "other";
-        KeyStore keys = ca.keyStoreWithPrivateKey();
+        KeyStore keys = ca.keyStoreWithPrivateKey(firstAlias);
         KeyStore other = ca.keyStoreWithPrivateKey(otherAlias);
 
         keys.setKeyEntry(otherAlias, other.getKey(otherAlias, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
