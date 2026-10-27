@@ -307,7 +307,8 @@ See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ign
 
 === Migrating an Existing Factory
 
-The inherited `create()` method keeps its cached context. Unmodified subclasses continue through `create()`, including those that supply a context through the protected cache.
+The deprecated `create()` method keeps its cached context. Existing subclasses can still use it, the protected `sslCtx` cache and the deprecated `createKeyManagers()` hook.
+The new `createSslBundle()` method requires an implementation; it does not adapt the old manager hook.
 
 To opt into fresh bundles, override `createSslBundle()`:
 
