@@ -37,7 +37,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
-import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
@@ -151,7 +150,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
             due.set(notAfter - window);
 
-            return ca.issue(notBefore, notAfter);
+            return ca.keyStoreWithPrivateKey(notBefore, notAfter);
         }, fresh(HOUR));
 
         IgniteEx g = startNode(issuer);
@@ -184,7 +183,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         ca = new TestCertificateAuthority("renewalca", notBefore - HOUR, authorityExpiry);
 
-        KeyStore keys = ca.issue(notBefore, authorityExpiry + HOUR);
+        KeyStore keys = ca.keyStoreWithPrivateKey(notBefore, authorityExpiry + HOUR);
 
         long due = authorityExpiry - (long)((authorityExpiry - notBefore) * DFLT_RENEW_BEFORE_FRACTION);
 
@@ -198,8 +197,16 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testLateFailureLoggedAsError() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = window / 4;
+        long notAfter = now + timeLeft;
 
-        IgniteEx g = startNode(new Issuer(valid(now - HOUR, now + 2 * MINUTE), failure()));
+        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), failure());
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
+
+        IgniteEx g = startNode(issuer);
 
         String late = "Failed to reload TLS certificates, the ones in use stay and expire soon [" + NODE_TRANSPORTS +
             ", initiator=automatic renewal, reason=" + ISSUER_DOWN;
@@ -212,10 +219,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
     /** A certificate that expires no later than the one in use must not be put in use. */
     @Test
-    public void testRenewalNotMovingExpiryRejected() {
+    public void testRenewalNotMovingExpiryRejected() throws Exception {
         long now = System.currentTimeMillis();
+        long notBefore = now - HOUR;
+        long notAfter = now + HOUR;
+        KeyStore startupKeys = ca.keyStoreWithPrivateKey("startup", notBefore, notAfter);
+        KeyStore replacement = ca.keyStoreWithPrivateKey("replacement", notBefore, notAfter);
 
-        SslContextProvider p = new SslContextProvider(new Issuer(valid(now - HOUR, now + 5 * MINUTE)));
+        SslContextProvider p = new SslContextProvider(new Issuer(() -> startupKeys, () -> replacement));
 
         assertRenewalRejected(p, "The new certificate chain expires no later than the one in use");
     }
@@ -223,7 +234,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     /** An automatic renewal preserves connections to a peer whose certificate and different authority stay unchanged. */
     @Test
     public void testRenewalWithDifferentAuthorities() throws Exception {
-        checkNodeRotation(new TestCertificateAuthority("peerca"));
+        assertNodesReconnectAfterRotationAndRestart(new TestCertificateAuthority("peerca"));
     }
 
     /** An expired certificate can be replaced with a valid chain from another authority. */
@@ -234,7 +245,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         TestCertificateAuthority other = new TestCertificateAuthority(authorityName);
 
-        Issuer issuer = new Issuer(valid(now - 2 * HOUR, now - HOUR), () -> other.issue(now, now + HOUR));
+        Issuer issuer = new Issuer(valid(now - 2 * HOUR, now - HOUR), () -> other.keyStoreWithPrivateKey(now, now + HOUR));
 
         SslContextProvider p = new SslContextProvider(issuer);
 
@@ -250,11 +261,18 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testRenewalLogsAppliedCertificate() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
         String renewedName = "renewed";
         String manualName = "manual";
 
-        Issuer issuer = new Issuer(valid(now - HOUR, now + MINUTE),
-            () -> ca.issue(renewedName, now, now + HOUR), () -> ca.issue(manualName, now, now + 2 * HOUR));
+        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter),
+            () -> ca.keyStoreWithPrivateKey(renewedName, now, now + HOUR),
+            () -> ca.keyStoreWithPrivateKey(manualName, now, now + 2 * HOUR));
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         SslContextProvider p = new SslContextProvider(issuer) {
             @Override X509Certificate renew(SSLContext expected) throws IgniteCheckedException {
@@ -302,7 +320,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
      */
     @Test
     public void testRenewalPlannedBeforeReloadSuperseded() throws Exception {
-        KeyStore inUse = ca.issue();
+        KeyStore inUse = ca.keyStoreWithPrivateKey();
 
         Issuer issuer = new Issuer(() -> inUse);
 
@@ -328,8 +346,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testReloadDuringRenewalPlanning() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
 
-        Issuer issuer = new Issuer(valid(now - HOUR, now + 9 * MINUTE), fresh(2 * HOUR), fresh(3 * HOUR));
+        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), fresh(2 * HOUR), fresh(3 * HOUR));
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         CountDownLatch planRead = new CountDownLatch(1);
         CountDownLatch continuePlanning = new CountDownLatch(1);
@@ -421,10 +445,18 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testReloadByCommandReplans() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
 
         pauses(MINUTE, MINUTE);
 
-        IgniteEx g = startNode(new Issuer(valid(now - HOUR, now + 9 * MINUTE), failure(), fresh(2 * HOUR), fresh(HOUR)));
+        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), failure(), fresh(2 * HOUR), fresh(HOUR));
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
+
+        IgniteEx g = startNode(issuer);
 
         assertTrue(waitForCondition(() -> logged(Level.WARN, ISSUER_DOWN) == 1, 30_000));
 
@@ -451,9 +483,15 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testReloadContextNotCarriedIntoRenewals() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
         String operator = "operator";
 
-        Issuer issuer = new Issuer(fresh(HOUR), valid(now - HOUR, now + 9 * MINUTE), fresh(HOUR));
+        Issuer issuer = new Issuer(fresh(HOUR), valid(notAfter - lifetime, notAfter), fresh(HOUR));
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         IgniteEx g = startNode(issuer);
 
@@ -474,11 +512,17 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testFailedRenewalRetried() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
         long minPause = 100;
         long maxPause = 4 * minPause;
 
-        Issuer issuer = new Issuer(valid(now - HOUR, now + 9 * MINUTE),
+        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter),
             failure(), failure(), failure(), failure(), failure(), failure(), fresh(HOUR));
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         pauses(minPause, maxPause);
 
@@ -529,16 +573,21 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testRenewalsNoMoreOftenThanMinPause() throws Exception {
         long minPause = 300;
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
         AtomicInteger issued = new AtomicInteger();
 
         Callable<KeyStore> dueOnIssue = () -> {
-            long t = System.currentTimeMillis();
-
             // A second later each time: notAfter is rounded down to a second, and a renewal that does not move it is refused.
-            return ca.issue(t - HOUR, t + 5 * MINUTE + issued.incrementAndGet() * SECOND);
+            long notAfter = System.currentTimeMillis() + timeLeft + issued.incrementAndGet() * SECOND;
+
+            return ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter);
         };
 
         Issuer issuer = new Issuer(dueOnIssue);
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         pauses(minPause, minPause);
 
@@ -568,8 +617,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testClientConnectorRenewed() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
 
-        Issuer issuer = new Issuer(valid(now - HOUR, now + 5 * MINUTE), fresh(HOUR));
+        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter), fresh(HOUR));
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         IgniteEx g = startClientConnectorOn(issuer);
 
@@ -577,12 +632,12 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         SslContextProvider p = provider(g, CLIENT_CONNECTOR);
 
-        long notAfter = SslCertificates.chainNotAfter(p.certificateChain());
+        long renewedExpiry = SslCertificates.chainNotAfter(p.certificateChain());
 
-        assertTrue(notAfter > now + 30 * MINUTE);
+        assertTrue(renewedExpiry > now + 30 * MINUTE);
         assertTrue(waitForCondition(() -> p.nextRenewalTime() > now + 30 * MINUTE, 10_000));
 
-        assertEquals("New connections must get the renewed certificate", notAfter,
+        assertEquals("New connections must get the renewed certificate", renewedExpiry,
             servedCertificate(probe(), g.context().clientListener().port()).getNotAfter().getTime());
     }
 
@@ -592,9 +647,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertFalse(new SslContextFactory().isRenewalEnabled());
 
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
 
-        Issuer issuer = new Issuer(valid(now - HOUR, now + 5 * MINUTE));
+        Issuer issuer = new Issuer(valid(notAfter - lifetime, notAfter));
 
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
         issuer.setRenewalEnabled(false);
 
         IgniteEx g = startNode(issuer);
@@ -614,7 +674,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         long now = System.currentTimeMillis();
 
-        KeyStore inUse = ca.issue(now - HOUR, now + HOUR);
+        KeyStore inUse = ca.keyStoreWithPrivateKey(now - HOUR, now + HOUR);
 
         Issuer nodeIssuer = new Issuer(() -> inUse, () -> inUse, fresh(2 * HOUR));
         Issuer clientIssuer = new Issuer(() -> inUse, () -> inUse, () -> inUse, fresh(2 * HOUR));
@@ -662,14 +722,20 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testWaitsForNewerCertificate() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
         long minPause = 100;
         long fourthPause = minPause * 2 * 2 * 2;
 
         pauses(minPause, 10 * minPause);
 
-        KeyStore inUse = ca.issue(now - HOUR, now + 9 * MINUTE);
+        KeyStore inUse = ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter);
 
         Issuer issuer = new Issuer(() -> inUse);
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         IgniteEx g = startNode(issuer);
 
@@ -720,7 +786,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
             if (inUse.get() == null) {
                 long notAfter = System.currentTimeMillis() + timeLeft;
 
-                inUse.set(ca.issue(notAfter - lifetime, notAfter));
+                inUse.set(ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter));
             }
 
             return inUse.get();
@@ -753,16 +819,22 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testStopDuringRenewalLogsNoFailure() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
 
         CountDownLatch entered = new CountDownLatch(1);
 
-        Issuer issuer = new Issuer(fresh(HOUR), valid(now - HOUR, now + 9 * MINUTE), () -> {
+        Issuer issuer = new Issuer(fresh(HOUR), valid(notAfter - lifetime, notAfter), () -> {
             entered.countDown();
 
             Thread.sleep(Long.MAX_VALUE);
 
             return null;
         });
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         IgniteEx g = startNode(issuer);
         SslContextProvider p = provider(g);
@@ -785,8 +857,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testInterruptedRenewalReturnPreservesState() throws Exception {
         long now = System.currentTimeMillis();
-        KeyStore original = ca.issue("original", now - HOUR, now + HOUR);
-        KeyStore replacement = ca.issue("replacement", now - MINUTE, now + 2 * HOUR);
+        KeyStore original = ca.keyStoreWithPrivateKey("original", now - HOUR, now + HOUR);
+        KeyStore replacement = ca.keyStoreWithPrivateKey("replacement", now - MINUTE, now + 2 * HOUR);
 
         for (KeyStore candidate : List.of(original, replacement)) {
             Issuer issuer = new Issuer(() -> original, () -> original, () -> original, failure(), () -> {
@@ -836,7 +908,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     public void testSameCertificatesUnchanged() throws Exception {
         long now = System.currentTimeMillis();
 
-        SSLContext cached = TestCertificateAuthority.context(ca.issue(), ca.trustStore());
+        SSLContext cached = TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
 
         SslContextProvider p = new SslContextProvider(() -> cached);
 
@@ -847,7 +919,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(2, p.renewalFailures());
         assertEquals(0, p.reloadOutcome().failures());
 
-        KeyStore expired = ca.issue(now - 2 * HOUR, now - HOUR);
+        KeyStore expired = ca.keyStoreWithPrivateKey(now - 2 * HOUR, now - HOUR);
 
         SslContextProvider expiredProvider = new SslContextProvider(new Issuer(() -> expired));
 
@@ -863,7 +935,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     public void testUnsuccessfulRenewalsCounted() throws Exception {
         long now = System.currentTimeMillis();
 
-        KeyStore inUse = ca.issue(now - HOUR, now + HOUR);
+        KeyStore inUse = ca.keyStoreWithPrivateKey(now - HOUR, now + HOUR);
 
         SslContextProvider p = new SslContextProvider(new Issuer(() -> inUse, () -> inUse, failure(), () -> inUse, fresh(2 * HOUR)));
 
@@ -889,10 +961,9 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         long notAfter = now + HOUR;
         String alias = "node";
 
-        KeyStore inUse = ca.issue(alias, notBefore, notAfter);
-
-        Issuer issuer = new Issuer(() -> inUse, () -> inUse, failure(), () -> inUse, () -> inUse,
-            valid(notBefore, notAfter), fresh(2 * HOUR));
+        KeyStore inUse = ca.keyStoreWithPrivateKey(alias, notBefore, notAfter);
+        AtomicReference<Callable<KeyStore>> keySupplier = new AtomicReference<>(() -> inUse);
+        Issuer issuer = new Issuer(() -> keySupplier.get().call());
 
         SslContextProvider p = new SslContextProvider(issuer);
 
@@ -900,11 +971,15 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(1, p.renewalFailures());
 
         // A failed manual reload is not an automatic renewal attempt.
+        keySupplier.set(failure());
+
         GridTestUtils.assertThrows(log, p::reload, IgniteException.class, ISSUER_DOWN);
 
         assertEquals(1, p.renewalFailures());
 
         // Reloading the same certificate clears the reload error, but not the renewal failures.
+        keySupplier.set(() -> inUse);
+
         p.reload();
 
         assertEquals(1, p.renewalFailures());
@@ -920,12 +995,18 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(1, p.renewalFailures());
 
         // A different certificate with the same expiry still does not extend the chain's lifetime.
+        KeyStore sameExpiry = ca.keyStoreWithPrivateKey(alias, notBefore, notAfter);
+
+        keySupplier.set(() -> sameExpiry);
+
         p.reload();
 
         assertFalse(inUse.getCertificate(alias).equals(p.certificate()));
         assertEquals(1, p.renewalFailures());
 
         // Only the final certificate extends the chain's lifetime.
+        keySupplier.set(() -> ca.keyStoreWithPrivateKey(notBefore, notAfter + HOUR));
+
         p.reload();
 
         assertEquals(0, p.renewalFailures());
@@ -942,7 +1023,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         ca = new TestCertificateAuthority("renewalca", notBefore - HOUR, authorityExpiry);
 
-        KeyStore inUse = ca.issue(notBefore, leafExpiry);
+        KeyStore inUse = ca.keyStoreWithPrivateKey(notBefore, leafExpiry);
 
         SslContextProvider p = new SslContextProvider(new Issuer(() -> inUse, () -> inUse, valid(notBefore, laterLeafExpiry)));
 
@@ -961,11 +1042,15 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testReplacedKeyStoreFileRenewed() throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
 
         Path keyStore = Files.createTempFile("ignite-ssl-renewal-", ".jks");
 
         try {
-            TestCertificateAuthority.save(ca.issue(now - HOUR, now + 9 * MINUTE), keyStore);
+            TestCertificateAuthority.save(ca.keyStoreWithPrivateKey(notAfter - lifetime, notAfter), keyStore);
 
             SslContextFactory factory = new SslContextFactory();
 
@@ -973,13 +1058,14 @@ public class SslRenewalTest extends GridCommonAbstractTest {
             factory.setKeyStorePassword(TestCertificateAuthority.PWD);
             factory.setKeyStoreType("JKS");
             factory.setTrustManagers(TestCertificateAuthority.trustManagers(ca.trustStore()));
+            factory.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
             factory.setRenewalEnabled(true);
 
             IgniteEx g = startNode(factory);
 
             assertTrue(waitForCondition(() -> logged(Level.WARN, WAITING) == 1, 30_000));
 
-            TestCertificateAuthority.save(ca.issue(now, now + HOUR), keyStore);
+            TestCertificateAuthority.save(ca.keyStoreWithPrivateKey(now, now + HOUR), keyStore);
 
             assertTrue(waitForCondition(() -> automaticRenewals(NODE_TRANSPORTS) == 1, 30_000));
             assertTrue(chainNotAfter(g) > now + 30 * MINUTE);
@@ -993,6 +1079,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testUnknownCertificateRefusedAtStart() {
         Issuer issuer = new Issuer(SslRenewalTest::noKey);
+
+        issuer.setRenewalEnabled(true);
 
         GridTestUtils.assertThrowsAnyCause(log, () -> startClientConnectorOn(issuer), IgniteException.class,
             "The SSL context factory provides no certificate chain");
@@ -1028,6 +1116,9 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     @Test
     public void testReloadCannotLoseMetadataWithRenewal() {
         Issuer issuer = new Issuer(fresh(HOUR), this::twoKeys);
+
+        issuer.setRenewalEnabled(true);
+
         SslContextProvider p = new SslContextProvider(issuer);
 
         issuer.setRenewalEnabled(false);
@@ -1053,8 +1144,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     /** @return Store with two valid private keys and therefore no single chain for renewal metadata. */
     private KeyStore twoKeys() throws Exception {
         String otherAlias = "other";
-        KeyStore keys = ca.issue();
-        KeyStore other = ca.issue(otherAlias);
+        KeyStore keys = ca.keyStoreWithPrivateKey();
+        KeyStore other = ca.keyStoreWithPrivateKey(otherAlias);
 
         keys.setKeyEntry(otherAlias, other.getKey(otherAlias, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
             other.getCertificateChain(otherAlias));
@@ -1118,13 +1209,19 @@ public class SslRenewalTest extends GridCommonAbstractTest {
      *
      * @param peerCa Authority of the peer whose certificate stays unchanged.
      */
-    private void checkNodeRotation(TestCertificateAuthority peerCa) throws Exception {
+    private void assertNodesReconnectAfterRotationAndRestart(TestCertificateAuthority peerCa) throws Exception {
         long now = System.currentTimeMillis();
+        long lifetime = HOUR;
+        long window = (long)(lifetime * DFLT_RENEW_BEFORE_FRACTION);
+        long timeLeft = 3 * window / 4;
+        long notAfter = now + timeLeft;
 
-        AtomicReference<KeyStore> keys = new AtomicReference<>(ca.issue("node0", now - HOUR, now + 9 * MINUTE));
-        KeyStore peerKeys = peerCa.issue("node1", now - MINUTE, now + HOUR);
+        AtomicReference<KeyStore> keys = new AtomicReference<>(ca.keyStoreWithPrivateKey("node0", notAfter - lifetime, notAfter));
+        KeyStore peerKeys = peerCa.keyStoreWithPrivateKey("node1", now - MINUTE, now + HOUR);
         Issuer issuer = issuer(keys::get, peerCa.trustStore(), true);
         Issuer peerIssuer = issuer(() -> peerKeys, ca.trustStore(), false);
+
+        issuer.setRenewBeforeFraction(DFLT_RENEW_BEFORE_FRACTION);
 
         IgniteEx g0 = startNode(0, issuer);
         IgniteEx g1 = startNode(1, peerIssuer);
@@ -1135,7 +1232,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertComputeWorks(g0, g1);
 
         String renewedAlias = "node0-new";
-        KeyStore replacement = ca.issue(renewedAlias, now, now + 2 * HOUR);
+        KeyStore replacement = ca.keyStoreWithPrivateKey(renewedAlias, now, now + 2 * HOUR);
         X509Certificate renewed = (X509Certificate)replacement.getCertificate(renewedAlias);
 
         keys.set(replacement);
@@ -1183,7 +1280,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
      * @return Step that issues a certificate valid for that time.
      */
     private Callable<KeyStore> valid(long notBefore, long notAfter) {
-        return () -> ca.issue(notBefore, notAfter);
+        return () -> ca.keyStoreWithPrivateKey(notBefore, notAfter);
     }
 
     /**
@@ -1194,7 +1291,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         return () -> {
             long now = System.currentTimeMillis();
 
-            return ca.issue(now, now + lifetime);
+            return ca.keyStoreWithPrivateKey(now, now + lifetime);
         };
     }
 
@@ -1207,7 +1304,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
     /** @return Context to connect to the nodes with; a new one each time, so that no session is resumed with an old certificate. */
     private SSLContext probe() throws Exception {
-        return TestCertificateAuthority.context(ca.issue(), ca.trustStore());
+        return TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
     }
 
     /**
@@ -1377,11 +1474,6 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         /** {@inheritDoc} */
         @Override protected void checkParameters() {
             // No-op.
-        }
-
-        /** {@inheritDoc} */
-        @Override protected KeyManager[] createKeyManagers() throws SSLException {
-            return createKeyMaterial().keyManagers();
         }
 
         /** {@inheritDoc} */
