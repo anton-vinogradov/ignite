@@ -280,14 +280,19 @@ public class SslContextProvider {
             return null;
 
         List<X509Certificate> earliest = null;
+        long earliestExpiry = Long.MAX_VALUE;
 
         for (List<X509Certificate> chain : chains.values()) {
             if (chain.isEmpty())
                 return null;
 
-            if (earliest == null || chainNotAfter(chain) < chainNotAfter(earliest) ||
-                chainNotAfter(chain) == chainNotAfter(earliest) && chain.get(0).getNotBefore().before(earliest.get(0).getNotBefore()))
+            long expiry = chainNotAfter(chain);
+
+            if (earliest == null || expiry < earliestExpiry ||
+                expiry == earliestExpiry && chain.get(0).getNotBefore().before(earliest.get(0).getNotBefore())) {
                 earliest = chain;
+                earliestExpiry = expiry;
+            }
         }
 
         return earliest;
