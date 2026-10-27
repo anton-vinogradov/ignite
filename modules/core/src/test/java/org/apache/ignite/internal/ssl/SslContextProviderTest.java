@@ -49,6 +49,8 @@ import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.GridTestUtils.assertThrowsWithCause;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Tests manual reload validation and certificate sources that supply optional metadata. */
 public class SslContextProviderTest extends GridCommonAbstractTest {
@@ -74,11 +76,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
     /** The node retains a bundle until reload and uses metadata from the factory's store loader. */
     @Test
     public void testNodeKeepsBundleUntilReload() throws Exception {
-        ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey) {
-            @Override public SSLContext create() {
-                throw new AssertionError("The node must use createSslBundle()");
-            }
-        };
+        ScriptedSslContextFactory factory = new ScriptedSslContextFactory(ca::keyStoreWithPrivateKey);
         SslContextProvider provider = new SslContextProvider(factory);
         SSLContext first = provider.context();
 
@@ -277,6 +275,47 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
         assertSame(original, provider.context());
         assertEquals(originalChains, provider.certificateChains());
+    }
+
+    /** A known private key without an X.509 chain cannot replace the working material. */
+    @Test
+    public void testMissingCertificateChainNotApplied() throws Exception {
+        String alias = "missing-chain";
+
+        assertMissingChainRejected(Map.of(alias, List.of()), alias);
+    }
+
+    /** A valid key does not hide another key whose X.509 chain is absent. */
+    @Test
+    public void testMissingChainAmongOtherKeysNotApplied() throws Exception {
+        String validAlias = "a-valid";
+        String missingAlias = "z-missing";
+        List<X509Certificate> validChain = List.of(TestCertificateAuthority.certificateChain(ca.keyStoreWithPrivateKey(validAlias)));
+
+        assertMissingChainRejected(Map.of(validAlias, validChain, missingAlias, List.of()), missingAlias);
+    }
+
+    /**
+     * @param candidateChains Explicit metadata supplied by a factory, with a known key lacking an X.509 chain.
+     * @param missingAlias Alias of that key.
+     */
+    private void assertMissingChainRejected(Map<String, List<X509Certificate>> candidateChains, String missingAlias) throws Exception {
+        SslBundle init = TestCertificateAuthority.bundle(ca.keyStoreWithPrivateKey(), ca.trustStore());
+        SSLContext candidate = TestCertificateAuthority.context(ca.keyStoreWithPrivateKey(), ca.trustStore());
+        AbstractSslContextFactory factory = mock(AbstractSslContextFactory.class);
+
+        when(factory.createSslBundle()).thenReturn(init, new SslBundle(candidate, candidateChains));
+
+        SslContextProvider provider = new SslContextProvider(factory);
+
+        Throwable failure = GridTestUtils.assertThrows(log, provider::reload, IgniteCheckedException.class,
+            "The private key has no X.509 certificate chain");
+
+        assertContains(log, failure.getMessage(), "alias=" + missingAlias);
+        assertContains(log, failure.getMessage(), "remove the key or provide its X.509 certificate chain");
+        assertSame(init.context(), provider.context());
+        assertEquals(init.certificateChains(), provider.certificateChains());
+        assertEquals(1, provider.reloadOutcome().failures());
     }
 
     /** An unsupported protocol in a replacement context leaves the working context in use. */

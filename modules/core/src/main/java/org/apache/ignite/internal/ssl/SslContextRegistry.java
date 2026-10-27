@@ -87,7 +87,7 @@ public class SslContextRegistry extends GridProcessorAdapter {
             X509Certificate invalid = SslCertificates.invalidAt(entry.getValue(), System.currentTimeMillis());
 
             if (invalid != null) {
-                U.warn(log, "The TLS certificate chain in use is not valid now on " + provider.transports() +
+                U.warn(log, "The TLS certificate chain in use is not valid now" +
                     "; put a valid certificate in place and run control.sh --ssl reload [alias=" + entry.getKey() + ", " +
                     SslCertificates.describe(invalid) + ']');
             }
