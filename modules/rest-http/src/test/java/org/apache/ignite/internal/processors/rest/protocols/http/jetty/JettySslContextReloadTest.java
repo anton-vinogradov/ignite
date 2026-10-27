@@ -219,7 +219,8 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
             assertVersionResponse(anonymous, NEW_SERVER_HOST);
         }
 
-        assertContains(log, status(g), "loaded subject=" + newCert.getSubjectX500Principal().getName() + ',');
+        assertContains(log, status(g),
+            "loaded alias=" + NEW_SERVER_HOST + ", subject=" + newCert.getSubjectX500Principal().getName() + ',');
 
         Files.write(keyStore, "not a key store".getBytes());
 
