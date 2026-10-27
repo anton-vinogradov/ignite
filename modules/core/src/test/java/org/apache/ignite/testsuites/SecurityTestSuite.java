@@ -75,6 +75,7 @@ import org.apache.ignite.internal.processors.security.service.ServiceAuthorizati
 import org.apache.ignite.internal.processors.security.service.ServiceStaticConfigTest;
 import org.apache.ignite.internal.processors.security.snapshot.SnapshotPermissionCheckTest;
 import org.apache.ignite.internal.ssl.SslContextProviderTest;
+import org.apache.ignite.internal.ssl.SslRenewalNodeTest;
 import org.apache.ignite.internal.ssl.SslRenewalTest;
 import org.apache.ignite.internal.thread.context.ComputeTaskOperationContextPropagationTest;
 import org.apache.ignite.internal.thread.context.OperationContextAttributePropagationTest;
@@ -152,6 +153,7 @@ import org.junit.runners.Suite;
     SslContextProviderTest.class,
     SslContextReloadTest.class,
     SslRenewalTest.class,
+    SslRenewalNodeTest.class,
     SslContextReuseTest.class,
     MaintenanceModeNodeSecurityTest.class,
     ServiceAuthorizationTest.class,
