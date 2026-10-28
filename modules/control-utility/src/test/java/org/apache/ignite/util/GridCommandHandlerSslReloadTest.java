@@ -17,9 +17,15 @@
 
 package org.apache.ignite.util;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.cache.configuration.Factory;
 import javax.net.ssl.SSLContext;
 import org.apache.ignite.internal.IgniteEx;
@@ -30,16 +36,17 @@ import org.apache.ignite.testframework.GridTestUtils;
 import org.junit.Assume;
 import org.junit.Test;
 
-import static org.apache.ignite.internal.IgniteNodeAttributes.ATTR_REST_TCP_PORT;
 import static org.apache.ignite.internal.commandline.CommandHandler.EXIT_CODE_OK;
 import static org.apache.ignite.internal.commandline.CommandHandler.EXIT_CODE_UNEXPECTED_ERROR;
 import static org.apache.ignite.ssl.SslTestUtils.node;
-import static org.apache.ignite.ssl.SslTestUtils.place;
-import static org.apache.ignite.ssl.SslTestUtils.servedSubject;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.GridTestUtils.assertNotContains;
 
-/** Tests {@code --ssl reload} and {@code --ssl status} through the command line handler. */
+/**
+ * {@code --ssl reload} and {@code --ssl status} through control.sh. Only the CLI handler runs the test: it connects to a node over
+ * the client connector TLS that the command reloads, while the JMX handler calls the node in process and would only repeat
+ * SslContextReloadTest.
+ */
 public class GridCommandHandlerSslReloadTest extends GridCommandHandlerAbstractTest {
     /** Key store the nodes run on; replaced on disk to rotate the certificate. */
     private Path keyStore;
@@ -83,12 +90,23 @@ public class GridCommandHandlerSslReloadTest extends GridCommandHandlerAbstractT
             Files.deleteIfExists(keyStore);
     }
 
-    /** One command reloads every node, client ones included. Status shows the new certificate. A broken store fails the command. */
+    /**
+     * The reload asks for confirmation. One command reloads every node, client ones included, and status shows the new
+     * certificate and the time of that reload; a broken store fails the command.
+     */
     @Test
     public void testReloadAndStatus() throws Exception {
         assertNotNull("The reload must ask for confirmation", new SslReloadCommand().confirmationPrompt(new NoArg()));
 
-        List<IgniteEx> nodes = List.of(startGrid(0), startGrid(1), startClientGrid(2));
+        IgniteEx srv0 = startGrid(0);
+        IgniteEx srv1 = startGrid(1);
+        IgniteEx cli = startClientGrid(CLIENT_NODE_NAME_PREFIX);
+
+        // Transports are listed alphabetically; a client node runs no binary REST.
+        Map<IgniteEx, String> transports = Map.of(
+            srv0, "binary REST, client connector, communication, discovery",
+            srv1, "binary REST, client connector, communication, discovery",
+            cli, "client connector, communication, discovery");
 
         String replacement = "node02";
         String replacementSubj = "CN=" + replacement;
@@ -96,30 +114,34 @@ public class GridCommandHandlerSslReloadTest extends GridCommandHandlerAbstractT
 
         place(replacement, keyStore);
 
+        long start = System.currentTimeMillis();
         String reloadOutput = executeCommand(EXIT_CODE_OK, "--ssl", "reload");
 
-        for (IgniteEx grid : nodes)
-            assertContains(log, reloadOutput,
-                node(grid) + ": reloaded " + transports(grid) + "; " + loaded);
-
-        assertEquals(replacementSubj, servedSubject(nodes.get(0).localNode().attribute(ATTR_REST_TCP_PORT)));
+        transports.forEach((g, t) -> assertContains(log, reloadOutput, node(g) + ": reloaded " + t + "; " + loaded));
 
         String statusOutput = executeCommand(EXIT_CODE_OK, "--ssl", "status");
 
-        for (IgniteEx grid : nodes)
-            assertContains(log, statusOutput, node(grid) + ": " + transports(grid));
+        transports.forEach((g, t) -> assertContains(log, statusOutput, node(g) + ": " + t + '\n'));
 
         assertContains(log, statusOutput, loaded);
         assertNotContains(log, statusOutput, "subject=CN=node01");
-        assertContains(log, statusOutput, "last reload succeeded at");
+
+        List<Instant> succeeded = Pattern.compile("last reload succeeded at (\\S+)").matcher(statusOutput).results()
+            .map(m -> Instant.parse(m.group(1))).collect(Collectors.toList());
+
+        assertEquals(statusOutput, transports.size(), succeeded.size());
+        succeeded.forEach(t -> assertFalse(statusOutput, t.isBefore(Instant.ofEpochMilli(start))));
 
         Files.write(keyStore, "not a key store".getBytes());
 
         assertContains(log, executeCommand(EXIT_CODE_UNEXPECTED_ERROR, "--ssl", "reload"), "Failed to initialize key store");
     }
 
-    /** @return Transports sharing the node's factory. Client nodes do not run binary REST. */
-    private static String transports(IgniteEx node) {
-        return (node.localNode().isClient() ? "" : "binary REST, ") + "client connector, communication, discovery";
+    /**
+     * @param name Test store, as {@code tests.properties} names it.
+     * @param dest File to replace.
+     */
+    private static void place(String name, Path dest) throws IOException {
+        Files.copy(Path.of(GridTestUtils.keyStorePath(name)), dest, StandardCopyOption.REPLACE_EXISTING);
     }
 }

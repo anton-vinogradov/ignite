@@ -184,7 +184,7 @@ Reload checks the dates of the certificate chains supplied by the factory. If an
 
 A custom factory can return a context without certificate information. Status then reports `certificate metadata is unavailable`, and reload cannot check certificate dates.
 
-With `SslContextFactory`, reload also rejects a store with no private keys or a private-key entry without a usable X.509 certificate chain. If there are no private keys, install the node's certificate chain and private key. If the error identifies an alias, add its missing X.509 chain or remove that unusable private-key entry, then run reload again.
+With `SslContextFactory`, reload also rejects stores that report no private-key entries or contain a private key without an X.509 certificate chain. The node cannot present a key whose chain is missing or contains a non-X.509 certificate. A node can still start with such a store if automatic renewal is disabled, but it logs a warning. Use the `no private-key entries reported` and `alias=...` rows in link:tools/control-script#checking-certificates[Checking Certificates] to correct the store before running reload.
 
 You must check that peers trust the replacement and that protocols, cipher suites and client authentication settings remain compatible. Reload does not test connections or undo a successful replacement if connections later fail.
 
@@ -259,13 +259,13 @@ For manual file replacement, use <<Upgrading Certificates>> and run reload after
 === Prepare Certificate Delivery
 
 Renewal follows the first certificate to expire across all private-key chains, including CA certificates.
-For that chain, the renewal window is the fraction `renewBeforeFraction` of the time from its leaf certificate's start date to its earliest expiry. Ignite starts requesting replacements when this window opens; `control.sh --ssl status` shows the next attempt time. If several chains expire together, the earliest window applies.
+For that chain, the renewal window is the last share of its lifetime set by the factory property `renewBeforeFraction`. The lifetime runs from the leaf certificate's start date to the earliest expiry in the chain. Ignite starts trying to load replacement certificates when the renewal window opens. If several chains expire at exactly the same time, renewal starts when the first of their windows opens.
 
 The delivery system must make a valid replacement available before the window opens. Ignite reads the files at each scheduled attempt, not when they change.
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
-With `SslContextFactory`, include the X.509 chain of every private key in the key store. A custom factory must supply all these chains with each context.
-Without complete chains, a node with automatic renewal enabled cannot start because it cannot determine when renewal is due.
+With `SslContextFactory`, the key store must contain at least one private-key entry and the complete X.509 chain of every private key. A custom factory must supply at least one chain and include the chain of every private key with each context.
+Without a private-key chain, or if any chain is incomplete, a node with automatic renewal enabled cannot start because it cannot determine when renewal is due.
 
 Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
 
@@ -359,8 +359,8 @@ If the source provides a key store, override `loadKeyMaterial()` to return link:
 The base factory builds the context and metadata from the same store load. Keep that store unchanged for as long as a context built from it is in use; load a new store to change certificates.
 To customize key-manager behavior, override `createKeyManagers(KeyMaterial)` and wrap the managers returned by `super.createKeyManagers(material)`. The managers and reported certificate chains must use the same loaded material.
 
-The bundle includes every private-key alias, even when the context can choose among several keys.
-An empty map reports that there are no private keys. An empty list for an alias means its certificate chain is missing or contains a non-X.509 certificate. Node reload rejects both cases.
+The bundle includes the alias and certificate chain of every private-key entry reported by the store, even when the context can choose among several keys.
+An empty map means no private-key entries are reported. An empty list for an alias means its certificate chain is missing or contains a non-X.509 certificate. Node reload rejects both cases.
 
 With automatic renewal enabled, every private key must have a nonempty chain at startup and on each reload. Without renewal, metadata is optional.
 See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html#createSslBundle()[method contract] for call ordering, concurrent calls and remote request handling.

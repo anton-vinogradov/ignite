@@ -17,6 +17,8 @@
 
 package org.apache.ignite.testframework;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -24,12 +26,14 @@ import java.nio.file.Path;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
+import java.security.KeyStoreSpi;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.net.ssl.KeyManager;
@@ -50,7 +54,7 @@ import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 
 /**
- * Issues JKS stores protected by {@link #PWD}, each with an EC P-256 private key and its certificate chain.
+ * Creates test stores protected by {@link #PWD}. Private keys use EC P-256, and trust stores hold authority certificates.
  * Certificates use SHA256withECDSA signatures. Issued leaf certificates allow both server and client authentication,
  * so the same material works for node-to-node TLS. Tests choose the issuer and validity dates when those are part of the scenario.
  */
@@ -103,21 +107,12 @@ public class TestCertificateAuthority {
      * Issues a certificate valid from an hour ago until a day from now, for tests that do not check expiry.
      *
      * @param cn Common name, also used as the key alias.
-     * @return Store with the private key and certificate chain.
+     * @return Key store with the private key and a chain containing the issued certificate and this authority's certificate.
      */
     public KeyStore keyStoreWithPrivateKey(String cn) throws Exception {
         long now = System.currentTimeMillis();
 
         return keyStoreWithPrivateKey(cn, now - TimeUnit.HOURS.toMillis(1), now + TimeUnit.DAYS.toMillis(1));
-    }
-
-    /**
-     * @param notBefore Time the certificate becomes valid; rounded down to a second.
-     * @param notAfter Time it expires; rounded down to a second.
-     * @return Store with one private key and a certificate with the requested validity dates.
-     */
-    public KeyStore keyStoreWithPrivateKey(long notBefore, long notAfter) throws Exception {
-        return keyStoreWithPrivateKey(DEFAULT_NAME, notBefore, notAfter);
     }
 
     /**
@@ -127,24 +122,35 @@ public class TestCertificateAuthority {
      * @return Key store with the private key and a chain containing the issued certificate and this authority's certificate.
      */
     public KeyStore keyStoreWithPrivateKey(String cn, long notBefore, long notAfter) throws Exception {
-        return keyStoreWithPrivateKey(cn, new X500Principal("CN=" + cn), keyPair(), notBefore, notAfter);
-    }
+        KeyPair pair = keyPair();
 
-    /**
-     * @param alias Alias for the private key and certificate chain.
-     * @param subject Subject of the certificate.
-     * @param pair Key pair of the certificate owner.
-     * @param notBefore Time it becomes valid; rounded down to a second.
-     * @param notAfter Time it expires; rounded down to a second.
-     * @return Key store with the private key and a chain containing the issued certificate and this authority's certificate.
-     */
-    private KeyStore keyStoreWithPrivateKey(String alias, X500Principal subject, KeyPair pair, long notBefore, long notAfter)
-        throws Exception {
-        X509Certificate leaf = sign(subject, pair, notBefore, notAfter, false);
+        X509Certificate leaf = sign(new X500Principal("CN=" + cn), pair, notBefore, notAfter, false);
 
         KeyStore store = emptyStore();
 
-        store.setKeyEntry(alias, pair.getPrivate(), PWD, new X509Certificate[] {leaf, cert});
+        store.setKeyEntry(cn, pair.getPrivate(), PWD, new X509Certificate[] {leaf, cert});
+
+        return store;
+    }
+
+    /**
+     * @param type Store type.
+     * @param alias Private-key alias.
+     * @return Saved and reloaded store with a private key but no certificate chain, protected by {@link #PWD}.
+     */
+    public static KeyStore keyStoreWithoutCertificateChain(String type, String alias) throws Exception {
+        KeyStore store = KeyStore.getInstance(type);
+
+        // KeyStore rejects a missing chain on insertion; its provider can still store and load such a key.
+        KeyStoreSpi spi = (KeyStoreSpi)store.getProvider().getService("KeyStore", type).newInstance(null);
+
+        spi.engineLoad(null, PWD);
+        spi.engineSetKeyEntry(alias, keyPair().getPrivate(), PWD, null);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        spi.engineStore(out, PWD);
+        store.load(new ByteArrayInputStream(out.toByteArray()), PWD);
 
         return store;
     }
@@ -165,6 +171,48 @@ public class TestCertificateAuthority {
             store.setCertificateEntry(a.name.getName(), a.cert);
 
         return store;
+    }
+
+    /**
+     * @param stores Stores issued here, with distinct aliases.
+     * @return Store with the private keys and chains of all of them.
+     */
+    public static KeyStore merged(KeyStore... stores) throws Exception {
+        KeyStore res = emptyStore();
+
+        for (KeyStore store : stores) {
+            for (String alias : Collections.list(store.aliases())) {
+                if (store.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class))
+                    res.setKeyEntry(alias, store.getKey(alias, PWD), PWD, store.getCertificateChain(alias));
+            }
+        }
+
+        return res;
+    }
+
+    /**
+     * @param keyStore Store with exactly one private key.
+     * @return Its certificate chain in the form certificate metadata uses.
+     */
+    public static List<X509Certificate> chain(KeyStore keyStore) throws Exception {
+        List<X509Certificate> chain = null;
+
+        for (String alias : Collections.list(keyStore.aliases())) {
+            if (!keyStore.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class))
+                continue;
+
+            if (chain != null)
+                throw new IllegalArgumentException("The test key store must contain exactly one private key");
+
+            Certificate[] certs = keyStore.getCertificateChain(alias);
+
+            chain = List.of(Arrays.copyOf(certs, certs.length, X509Certificate[].class));
+        }
+
+        if (chain == null)
+            throw new IllegalArgumentException("The test key store must contain exactly one private key");
+
+        return chain;
     }
 
     /**
@@ -195,40 +243,6 @@ public class TestCertificateAuthority {
     }
 
     /**
-     * @param keyStore Store with at most one private key.
-     * @return Its certificate chain, or {@code null} if the store has no private key.
-     */
-    public static X509Certificate[] certificateChain(KeyStore keyStore) throws Exception {
-        X509Certificate[] chain = null;
-
-        for (String alias : Collections.list(keyStore.aliases())) {
-            if (!keyStore.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class))
-                continue;
-
-            if (chain != null)
-                throw new IllegalArgumentException("The test key store must contain at most one private key");
-
-            Certificate[] certs = keyStore.getCertificateChain(alias);
-
-            chain = Arrays.copyOf(certs, certs.length, X509Certificate[].class);
-        }
-
-        return chain;
-    }
-
-    /**
-     * @param keyStore Store with the certificate to present.
-     * @return Key managers that present it.
-     */
-    public static KeyManager[] keyManagers(KeyStore keyStore) throws Exception {
-        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-
-        kmf.init(keyStore, PWD);
-
-        return kmf.getKeyManagers();
-    }
-
-    /**
      * @param trustStore Store with the authorities to trust.
      * @return Trust managers that trust them.
      */
@@ -248,6 +262,18 @@ public class TestCertificateAuthority {
         try (OutputStream out = Files.newOutputStream(path)) {
             store.store(out, PWD);
         }
+    }
+
+    /**
+     * @param keyStore Store with the certificate to present.
+     * @return Key managers that present it.
+     */
+    private static KeyManager[] keyManagers(KeyStore keyStore) throws Exception {
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+
+        kmf.init(keyStore, PWD);
+
+        return kmf.getKeyManagers();
     }
 
     /**
