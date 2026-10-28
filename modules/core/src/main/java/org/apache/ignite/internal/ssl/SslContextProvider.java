@@ -125,15 +125,8 @@ public class SslContextProvider {
         if (renewBeforeFraction == 0)
             return;
 
-        try {
-            checkKeyMaterial(bundle.certificateChains());
-        }
-        catch (IgniteCheckedException e) {
-            throw new IgniteException(e.getMessage(), e);
-        }
-
         if (renewalChain(bundle) == null) {
-            throw new IgniteException("The SSL context factory must provide a nonempty certificate chain for every private key " +
+            throw new IgniteException("The SSL context factory must provide at least one X.509 certificate chain " +
                 "to renew automatically [transports=" + transports() + ']');
         }
 
@@ -182,8 +175,9 @@ public class SslContextProvider {
      *
      * @param expected Context the renewal was planned for.
      * @return Installed bundle, or {@code null} if its chains are unchanged or the planned context had already been replaced.
-     * @throws IgniteCheckedException If any chain is unknown, fails the checks of {@link #reload()} or the earliest expiry
-     *      does not advance, or if the thread is interrupted by the time the factory returns; the interrupt flag then stays set.
+     * @throws IgniteCheckedException If certificate metadata is unknown, the bundle fails the checks of {@link #reload()},
+     *      or the earliest expiry does not advance, or if the thread is interrupted by the time the factory returns;
+     *      the interrupt flag then stays set.
      */
     synchronized @Nullable SslBundle renew(SSLContext expected) throws IgniteCheckedException {
         if (bundle.context() != expected)
@@ -251,7 +245,7 @@ public class SslContextProvider {
      * Chooses the first chain to expire, using the earliest leaf validity start to break ties.
      *
      * @param bundle Context and its chains.
-     * @return Chain that determines renewal, or {@code null} unless every private key has a nonempty X.509 chain.
+     * @return Chain that determines renewal, or {@code null} if certificate metadata is unknown or contains no chains.
      */
     static @Nullable List<X509Certificate> renewalChain(SslBundle bundle) {
         Map<String, List<X509Certificate>> chains = bundle.certificateChains();
@@ -263,9 +257,6 @@ public class SslContextProvider {
         long earliestExpiry = Long.MAX_VALUE;
 
         for (List<X509Certificate> chain : chains.values()) {
-            if (chain.isEmpty())
-                return null;
-
             long expiry = chainNotAfter(chain);
 
             if (earliest == null || expiry < earliestExpiry ||
@@ -314,15 +305,14 @@ public class SslContextProvider {
 
     /**
      * @param next Bundle loaded by the factory.
-     * @param requireChains Whether renewal requires known chains for every private key.
-     * @throws IgniteCheckedException If a required chain is missing or a certificate is outside its validity period.
+     * @param requireChains Whether at least one reported chain is required for renewal.
+     * @throws IgniteCheckedException If required certificate metadata is unknown or empty, or a certificate is outside its validity period.
      */
     private void check(SslBundle next, boolean requireChains) throws IgniteCheckedException {
-        if (requireChains && renewalChain(next) == null)
-            throw new IgniteCheckedException("The new SSL context must provide a nonempty certificate chain for every private key " +
-                "to renew automatically");
-
         Map<String, List<X509Certificate>> chains = next.certificateChains();
+
+        if (requireChains && (chains == null || chains.isEmpty()))
+            throw new IgniteCheckedException("The new SSL context must provide at least one X.509 certificate chain to renew automatically");
 
         if (chains == null)
             return;
