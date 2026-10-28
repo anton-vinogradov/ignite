@@ -266,7 +266,7 @@ For that chain, the renewal window is the last share of its lifetime set by the 
 The delivery system must make a valid replacement available before the window opens. Ignite reads the files at each scheduled attempt, not when they change.
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
-Provide at least one private key with its X.509 certificate chain. `SslContextFactory` ignores entries whose chains are missing, empty or contain a non-X.509 certificate. A custom factory must supply the TLS certificate chains used by its context.
+Provide at least one private key with its X.509 certificate chain. Entries whose chains are missing, empty or contain a non-X.509 certificate are omitted from certificate status and renewal scheduling. A custom factory must supply the TLS certificate chains used by its context.
 A node with automatic renewal enabled cannot start if the factory supplies no chains or cannot report them.
 
 Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
