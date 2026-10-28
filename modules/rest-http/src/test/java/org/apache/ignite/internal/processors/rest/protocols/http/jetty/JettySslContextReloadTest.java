@@ -71,6 +71,9 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     /** Jetty configuration with a connector that has an SSL connection factory of its own. */
     private static final String JETTY_SSL = "modules/rest-http/src/test/resources/jetty-ssl.xml";
 
+    /** Jetty configuration with HTTP as its default protocol and an SSL connection factory of its own. */
+    private static final String JETTY_HTTP_WITH_SSL = "modules/rest-http/src/test/resources/jetty-http-with-ssl.xml";
+
     /** Jetty configuration with a connector that expects the PROXY protocol before HTTP. */
     private static final String JETTY_PROXY = "modules/rest-http/src/test/resources/jetty-proxy.xml";
 
@@ -234,6 +237,14 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     public void testJettySslConnectionFactoryRefused() {
         GridTestUtils.assertThrowsAnyCause(log, () -> startGrid(0, cfg -> {
             cfg.setConnectorConfiguration(new ConnectorConfiguration().setJettyPath(JETTY_SSL).setHttpSslFactory(factory()));
+        }), IgniteCheckedException.class, "must have no SSL connection factory of its own");
+    }
+
+    /** An existing SSL connection factory is refused even when the connector's default protocol is HTTP. */
+    @Test
+    public void testJettySslConnectionFactoryWithHttpDefaultRefused() {
+        GridTestUtils.assertThrowsAnyCause(log, () -> startGrid(0, cfg -> {
+            cfg.setConnectorConfiguration(new ConnectorConfiguration().setJettyPath(JETTY_HTTP_WITH_SSL).setHttpSslFactory(factory()));
         }), IgniteCheckedException.class, "must have no SSL connection factory of its own");
     }
 
