@@ -17,6 +17,8 @@
 
 package org.apache.ignite.testframework;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -24,6 +26,7 @@ import java.nio.file.Path;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
+import java.security.KeyStoreSpi;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
@@ -51,8 +54,7 @@ import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 
 /**
- * Issues JKS stores protected by {@link #PWD}. Key stores hold EC P-256 private keys with their certificate chains, and trust
- * stores hold authority certificates.
+ * Creates test stores protected by {@link #PWD}. Private keys use EC P-256, and trust stores hold authority certificates.
  * Certificates use SHA256withECDSA signatures. Issued leaf certificates allow both server and client authentication,
  * so the same material works for node-to-node TLS. Tests choose the issuer and validity dates when those are part of the scenario.
  */
@@ -127,6 +129,28 @@ public class TestCertificateAuthority {
         KeyStore store = emptyStore();
 
         store.setKeyEntry(cn, pair.getPrivate(), PWD, new X509Certificate[] {leaf, cert});
+
+        return store;
+    }
+
+    /**
+     * @param type Store type.
+     * @param alias Private-key alias.
+     * @return Saved and reloaded store with a private key but no certificate chain, protected by {@link #PWD}.
+     */
+    public static KeyStore keyStoreWithoutCertificateChain(String type, String alias) throws Exception {
+        KeyStore store = KeyStore.getInstance(type);
+
+        // KeyStore rejects a missing chain on insertion; its provider can still store and load such a key.
+        KeyStoreSpi spi = (KeyStoreSpi)store.getProvider().getService("KeyStore", type).newInstance(null);
+
+        spi.engineLoad(null, PWD);
+        spi.engineSetKeyEntry(alias, keyPair().getPrivate(), PWD, null);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        spi.engineStore(out, PWD);
+        store.load(new ByteArrayInputStream(out.toByteArray()), PWD);
 
         return store;
     }

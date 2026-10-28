@@ -105,7 +105,8 @@ public class SslContextRegistry extends GridProcessorAdapter {
             return;
 
         if (chains.isEmpty())
-            U.warn(log, "The key material has no private key, so the node presents no certificate; reload rejects such key material");
+            U.warn(log, "The key material reports no private-key entries, so the node presents no certificate; " +
+                "reload rejects such key material");
 
         for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
             if (entry.getValue().isEmpty()) {

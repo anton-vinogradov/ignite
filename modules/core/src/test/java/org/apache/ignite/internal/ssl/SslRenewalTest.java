@@ -192,7 +192,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         SslContextProvider p = new SslContextProvider(f);
 
-        assertRenewalRejected("No private key", p, "The new key material has no private key, so the node would present no certificate");
+        assertRenewalRejected("No private key", p,
+            "The new key material reports no private-key entries, so the node would present no certificate");
         assertRenewalRejected("Not valid yet", p, "The new certificate chain is not valid now [alias=not-yet-valid, ");
     }
 
@@ -382,7 +383,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         GridTestUtils.assertThrows(log, () -> unknownProvider.startRenewal(exec, renewalLog), IgniteException.class,
             "The SSL context factory must provide a nonempty certificate chain for every private key to renew automatically");
         GridTestUtils.assertThrows(log, () -> noKeyProvider.startRenewal(exec, renewalLog), IgniteException.class,
-            "The new key material has no private key, so the node would present no certificate");
+            "The new key material reports no private-key entries, so the node would present no certificate");
         GridTestUtils.assertThrows(log, () -> noChainProvider.startRenewal(exec, renewalLog), IgniteException.class,
             "The private key has no X.509 certificate chain; remove the key or provide its X.509 certificate chain [alias=z-no-chain]");
     }
