@@ -142,8 +142,8 @@ public class SslContextProvider {
     }
 
     /**
-     * Builds and installs a new context for new connections, recording success or failure. Rejects key material known to have no
-     * private key or to contain a private key without an X.509 certificate chain. Every supplied certificate must be within its
+     * Builds and installs a new context for new connections, recording success or failure. Rejects key material that reports no
+     * private-key entries or contains a private key without an X.509 certificate chain. Every supplied certificate must be within its
      * validity period.
      * Certificate metadata is required when automatic renewal is enabled.
      * The administrator must ensure that peers trust the new certificates and can connect with the new context.
@@ -280,7 +280,7 @@ public class SslContextProvider {
 
     /**
      * @return Bundle built anew, or the context in use if a custom factory caches it.
-     * @throws IgniteCheckedException If the loaded material has no private key or a key has no X.509 certificate chain.
+     * @throws IgniteCheckedException If the loaded material reports no private-key entries or a key has no X.509 certificate chain.
      */
     private SslBundle build() throws IgniteCheckedException {
         SslBundle rebuilt = createBundle();
@@ -294,14 +294,15 @@ public class SslContextProvider {
 
     /**
      * @param chains Chains by private-key alias, {@code null} if the factory supplies no metadata.
-     * @throws IgniteCheckedException If there is no private key or a key has no X.509 certificate chain.
+     * @throws IgniteCheckedException If no private-key entries are reported or a key has no X.509 certificate chain.
      */
     private static void checkKeyMaterial(@Nullable Map<String, List<X509Certificate>> chains) throws IgniteCheckedException {
         if (chains == null)
             return;
 
         if (chains.isEmpty())
-            throw new IgniteCheckedException("The new key material has no private key, so the node would present no certificate");
+            throw new IgniteCheckedException("The new key material reports no private-key entries, " +
+                "so the node would present no certificate");
 
         for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
             if (entry.getValue().isEmpty()) {

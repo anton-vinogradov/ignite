@@ -156,7 +156,7 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
 
         SslContextProvider p = new SslContextProvider(f);
 
-        assertReloadRejected(p, "The new key material has no private key, so the node would present no certificate");
+        assertReloadRejected(p, "The new key material reports no private-key entries, so the node would present no certificate");
         assertReloadRejected(p, "The private key has no X.509 certificate chain; remove the key or provide its X.509 certificate " +
             "chain [alias=z-no-chain]");
     }
@@ -248,8 +248,8 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         when(noChain.createSslBundle()).thenReturn(new SslBundle(ctx, Map.of("a-valid", chain(valid), "z-no-chain", List.of())));
 
         ListeningTestLogger registryLog = new ListeningTestLogger(log);
-        LogListener noKeyWarned = LogListener.matches("The key material has no private key, so the node presents no certificate; " +
-            "reload rejects such key material").times(1).build();
+        LogListener noKeyWarned = LogListener.matches("The key material reports no private-key entries, " +
+            "so the node presents no certificate; reload rejects such key material").times(1).build();
         LogListener noChainWarned = LogListener.matches("The private key has no X.509 certificate chain, so the node never presents " +
             "it; reload rejects this key store until the key is removed or its X.509 certificate chain is provided " +
             "[alias=z-no-chain]").times(1).build();

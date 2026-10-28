@@ -25,6 +25,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import javax.net.ssl.SSLContext;
 import org.apache.ignite.IgniteLogger;
 import org.apache.ignite.internal.thread.context.OperationContext;
@@ -65,6 +66,9 @@ class SslRenewal {
     /** */
     private final IgniteLogger log;
 
+    /** Current time in milliseconds. */
+    private final LongSupplier currentTimeMillis;
+
     /** Last planned attempt, {@code null} before the first one. */
     private ScheduledFuture<?> next;
 
@@ -93,10 +97,28 @@ class SslRenewal {
      * @param log Logger.
      */
     SslRenewal(SslContextProvider provider, double renewBeforeFraction, ScheduledExecutorService exec, IgniteLogger log) {
+        this(provider, renewBeforeFraction, exec, log, System::currentTimeMillis);
+    }
+
+    /**
+     * @param provider Provider whose context the factory builds.
+     * @param renewBeforeFraction Share of the certificate lifetime left when the renewal window opens.
+     * @param exec Renewal thread.
+     * @param log Logger.
+     * @param currentTimeMillis Current time in milliseconds.
+     */
+    SslRenewal(
+        SslContextProvider provider,
+        double renewBeforeFraction,
+        ScheduledExecutorService exec,
+        IgniteLogger log,
+        LongSupplier currentTimeMillis
+    ) {
         this.provider = provider;
         this.renewBeforeFraction = renewBeforeFraction;
         this.exec = exec;
         this.log = log;
+        this.currentTimeMillis = currentTimeMillis;
     }
 
     /** @return Time of the next automatic renewal, {@code 0} if none is planned. */
@@ -122,7 +144,8 @@ class SslRenewal {
 
         window = (long)(lifetime * renewBeforeFraction);
 
-        long at = Math.max(chainNotAfter - window, Math.max(provider.reloadOutcome().successTime() + minPause, System.currentTimeMillis()));
+        long at = Math.max(chainNotAfter - window,
+            Math.max(provider.reloadOutcome().successTime() + minPause, currentTimeMillis.getAsLong()));
 
         schedule(at, planned.context());
 
@@ -163,7 +186,7 @@ class SslRenewal {
         if (exec.isShutdown())
             return;
 
-        long now = System.currentTimeMillis();
+        long now = currentTimeMillis.getAsLong();
 
         pause = pause == 0 ? minPause : Math.min(pause * 2, maxPause);
 
@@ -205,7 +228,7 @@ class SslRenewal {
 
         nextRenewalTime = at;
 
-        next = submit(() -> attempt(planned), Math.max(0, at - System.currentTimeMillis()));
+        next = submit(() -> attempt(planned), Math.max(0, at - currentTimeMillis.getAsLong()));
     }
 
     /**

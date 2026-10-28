@@ -1825,9 +1825,9 @@ Status does not test connections or verify that other nodes and clients trust th
 |`certificate metadata is unavailable`
 |The factory did not supply metadata, so status cannot check certificate dates. Check them directly in the key store or other certificate source. For a custom factory, see link:security/ssl-tls#custom-ssl-context-factories[Custom SSL Context Factories].
 |`alias=...: certificate chain is absent or is not X.509`
-|This private-key entry has no usable X.509 certificate chain. Add its X.509 chain or remove the unusable private-key entry, then run reload. Reload rejects a replacement that still contains such an entry.
-|`no private keys`
-|The loaded source contains no private key. Install the node's certificate and private key, then run reload.
+|This private key has no certificate chain, or its chain contains a non-X.509 certificate. The node never presents such a key. Add its X.509 chain or remove the key, then run reload.
+|`no private-key entries reported`
+|Install the node's private key and its X.509 certificate chain in the configured key store, then run reload.
 |`no SSL context factory is configured`
 |This node has no certificates managed by these commands. This message does not make either command fail.
 |===

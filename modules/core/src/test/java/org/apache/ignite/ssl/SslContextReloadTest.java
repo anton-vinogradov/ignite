@@ -77,6 +77,7 @@ import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.TestCertificateAuthority.chain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.context;
+import static org.apache.ignite.testframework.TestCertificateAuthority.keyStoreWithoutCertificateChain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.merged;
 import static org.apache.ignite.testframework.TestCertificateAuthority.save;
 import static org.mockito.Mockito.mock;
@@ -335,6 +336,35 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
             "\\S+: " + Pattern.quote(reason)).matcher(status).find());
     }
 
+    /** A real PKCS12 replacement with a private key but no certificate chain is refused, and new connections keep the old certificate. */
+    @Test
+    public void testKeyWithoutCertificateChainNotApplied() throws Exception {
+        String name = getTestIgniteInstanceName(0);
+        String alias = "key-without-chain";
+        String storeType = "PKCS12";
+        KeyStore startupKeys = KeyStore.getInstance(storeType);
+
+        startupKeys.load(null, null);
+        startupKeys.setKeyEntry(OLD_KEY, oldKeys.getKey(OLD_KEY, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
+            oldKeys.getCertificateChain(OLD_KEY));
+
+        save(startupKeys, keyFile(name));
+
+        IgniteEx g = startGrid(0, cfg -> {
+            ((SslContextFactory)cfg.getSslContextFactory()).setKeyStoreType(storeType);
+        });
+        KeyStore replacement = keyStoreWithoutCertificateChain(storeType, alias);
+
+        assertTrue(replacement.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class));
+        assertNull(replacement.getCertificateChain(alias));
+
+        save(replacement, keyFile(name));
+
+        assertContains(log, reloadFailure(g), "The private key has no X.509 certificate chain; remove the key or provide its " +
+            "X.509 certificate chain [alias=" + alias + ']');
+        assertEquals(oldCert, servedCertificate(context(oldKeys, trustBoth), discoveryPort(g)));
+    }
+
     /** Both commands report a node that is unavailable when jobs are mapped and still run on the other nodes. */
     @Test
     public void testUnavailableNodeReported() throws Exception {
@@ -443,6 +473,7 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
     /**
      * The authority is replaced with three reloads: trust both authorities, present a key of the new one, trust only the new one.
+     * After the first reload, clients of both authorities connect while the node still presents its old certificate.
      * Then the discovery, communication, client connector and binary REST ports accept a client of the new authority and refuse
      * one of the old authority and one without a certificate, a reopened communication connection works, and a node of the new
      * authority joins.
@@ -460,6 +491,18 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
         placeTrust(trustBoth);
         reload(g0);
+
+        for (KeyStore keys : List.of(oldKeys, newKeys)) {
+            SSLContext clientCtx = context(keys, trustBoth);
+
+            try (IgniteClient cli = Ignition.startClient(new ClientConfiguration()
+                .setAddresses("127.0.0.1:" + g0.context().clientListener().port())
+                .setSslMode(SslMode.REQUIRED).setSslContextFactory(() -> clientCtx)
+                .setPartitionAwarenessEnabled(false).setClusterDiscoveryEnabled(false))) {
+                cli.cacheNames();
+            }
+        }
+
         placeKeys(newKeys);
         reload(g0);
         placeTrust(newCa.trustStore());
