@@ -31,6 +31,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.net.ssl.SSLContext;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.IgniteException;
@@ -76,9 +77,9 @@ import static org.mockito.Mockito.when;
  * replans on reload, drops an outdated attempt and runs without the operator context. The log names the installed certificate,
  * sets the level of a failure by the time left and reports a wait once per lateness, again on expiry. Tests enable renewal on
  * a factory mock and script its bundles; pauses are the production ones, a minute to an hour. Renewal plans and attempts in
- * tasks of an executor that records them with their delays and runs one only when a test calls {@code runNext()}. Only two
- * tests wait: the operator context test runs on the kind of executor a node uses and waits for its attempt, and the last test
- * waits for a certificate to expire. An appender on the logger of {@link SslRenewal} captures what renewal logs.
+ * tasks of an executor that records them with their delays and runs one only when a test calls {@code runNext()}. Only one
+ * test waits: the operator context test runs on the kind of executor a node uses and waits for its attempt. The expiry test
+ * advances the scheduler's clock explicitly. An appender on the logger of {@link SslRenewal} captures what renewal logs.
  */
 public class SslRenewalTest extends GridCommonAbstractTest {
     /** */
@@ -727,25 +728,27 @@ public class SslRenewalTest extends GridCommonAbstractTest {
     }
 
     /**
-     * A wait logged as expiring soon is logged again once the certificates have expired, and not after that. The certificate expires
-     * within 3 seconds, which the test waits for.
+     * A wait logged as expiring soon is logged again once the certificates have expired, and not after that.
      */
     @Test
     public void testWaitLoggedAgainOnExpiry() throws Exception {
-        // X.509 keeps whole seconds. With 2 to 3 seconds left, the first attempt comes before expiry even on a slow machine.
-        long notAfter = (System.currentTimeMillis() / SECOND + 3) * SECOND;
+        KeyStore inUse = ca.keyStoreWithPrivateKey();
+        long notAfter = chain(inUse).get(0).getNotAfter().getTime();
+
+        // Hold the scheduler's clock before expiry until the test advances it.
+        AtomicLong now = new AtomicLong(notAfter - SECOND);
         AbstractSslContextFactory f = renewingFactory(QUARTER);
         RecordingExecutor exec = new RecordingExecutor();
 
-        when(f.createSslBundle()).thenReturn(bundle(ca.keyStoreWithPrivateKey("in-use", notAfter - 2 * HOUR, notAfter), ca.trustStore()));
+        when(f.createSslBundle()).thenReturn(bundle(inUse, ca.trustStore()));
 
         SslContextProvider p = new SslContextProvider(f);
 
-        p.startRenewal(exec, renewalLog);
+        new SslRenewal(p, QUARTER, exec, renewalLog, now::get).replan();
         exec.runNext();
         exec.runNext();
 
-        assertTrue(waitForCondition(() -> System.currentTimeMillis() >= notAfter, 10_000));
+        now.set(notAfter);
 
         exec.runNext();
         exec.runNext();
