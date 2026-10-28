@@ -62,7 +62,7 @@ tab:C#/.NET[]
 tab:C++[unsupported]
 --
 
-The keystore must contain the node's certificate and private key. For automatic renewal, include the X.509 chain of every private key.
+The keystore must contain the node's certificate and private key.
 
 The trust store defines which peer certificates the node accepts. Configure trust on all nodes and clients before replacing certificates.
 
@@ -184,7 +184,9 @@ Reload checks the dates of the certificate chains supplied by the factory. If an
 
 A custom factory can return a context without certificate information. Status then reports `certificate metadata is unavailable`, and reload cannot check certificate dates.
 
-With `SslContextFactory`, reload also rejects stores that report no private-key entries or report a private-key entry without an X.509 certificate chain. The node cannot present a key whose chain is missing or contains a non-X.509 certificate. A node can still start with such a store if automatic renewal is disabled, but it logs a warning. Use the `no private-key entries reported` and `alias=...` rows in link:tools/control-script#checking-certificates[Checking Certificates] to correct the store before running reload.
+With `SslContextFactory`, status lists only keys with a nonempty X.509 certificate chain. Keys without a chain, or whose chain contains a non-X.509 certificate, are omitted. After reload, check that every alias you expect appears in status.
+
+Reload also rejects a replacement with no X.509 certificate chains. A node can still start with such a store if automatic renewal is disabled, but it logs a warning. Follow the `no X.509 certificate chains` row in link:tools/control-script#checking-certificates[Checking Certificates] to correct the store before running reload.
 
 You must check that peers trust the replacement and that protocols, cipher suites and client authentication settings remain compatible. Reload does not test connections or undo a successful replacement if connections later fail.
 
@@ -258,16 +260,17 @@ For manual file replacement, use <<Upgrading Certificates>> and run reload after
 
 === Prepare Certificate Delivery
 
-Renewal follows the first certificate to expire across all private-key chains, including CA certificates.
+Renewal follows the first certificate to expire across the TLS certificate chains loaded by the factory, including CA certificates.
 For that chain, the renewal window is the last share of its lifetime set by the factory property `renewBeforeFraction`. The lifetime runs from the leaf certificate's start date to the earliest expiry in the chain. Ignite starts trying to load replacement certificates when the renewal window opens. If several chains expire at exactly the same time, renewal starts when the first of their windows opens.
 
 The delivery system must make a valid replacement available before the window opens. Ignite reads the files at each scheduled attempt, not when they change.
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
-With `SslContextFactory`, the key store must contain at least one private-key entry and the complete X.509 chain of every private key. A custom factory must supply at least one chain and include the chain of every private key with each context.
-A node with automatic renewal enabled cannot start unless the factory reports at least one private-key entry and supplies a nonempty X.509 chain for every reported entry.
+Provide at least one private key with its X.509 certificate chain. Entries whose chains are missing, empty or contain a non-X.509 certificate are omitted from certificate status and renewal scheduling. A custom factory must supply the TLS certificate chains used by its context.
+A node with automatic renewal enabled cannot start if the factory supplies no chains or cannot report them.
 
 Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
+If an entry loses its X.509 chain, it is treated as removed. The remaining chains must still advance the earliest expiry for renewal to apply the replacement.
 
 Nodes and applications must trust the replacement certificates before they are loaded. For a new CA, follow the stages in <<Upgrading Certificates>>.
 When renewal installs a replacement certificate, `SslContextFactory` also reloads its trust store. Keep the old CA in the trust store until every affected node and application has switched certificates. Otherwise, the renewed node cannot connect to nodes that still use certificates from the old CA. To apply a trust store change without replacing the certificate, run `control.sh --ssl reload`.
@@ -351,7 +354,7 @@ The link:monitoring-metrics/new-metrics#ssl[`ssl.ConsecutiveRenewalFailures`] me
 This section is for developers integrating a certificate source, such as a PKI service.
 
 To support reload and automatic renewal with certificate status, extend link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html[AbstractSslContextFactory].
-Its `createSslBundle()` method builds a fresh link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/SslBundle.html[SslBundle] containing the initialized context and the certificate chains loaded with it, indexed by private-key alias.
+Its `createSslBundle()` method builds a fresh link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/SslBundle.html[SslBundle] containing the initialized context and the certificate chains loaded with it, indexed by key alias.
 The final `create()` method returns `createSslBundle().context()`: each call creates a new context, with no cache in the factory.
 Nodes call `createSslBundle()` directly; callers using `Factory<SSLContext>` obtain its context through `create()`.
 
@@ -359,10 +362,10 @@ If the source provides a key store, override `loadKeyMaterial()` to return link:
 The base factory builds the context and metadata from the same store load. Keep that store unchanged for as long as a context built from it is in use; load a new store to change certificates.
 To customize key-manager behavior, override `createKeyManagers(KeyMaterial)` and wrap the managers returned by `super.createKeyManagers(material)`. The managers and reported certificate chains must use the same loaded material.
 
-The bundle includes the alias and certificate chain of every private-key entry reported by the store, even when the context can choose among several keys.
-An empty map means no private-key entries are reported. An empty list for an alias means its certificate chain is missing or contains a non-X.509 certificate. Node reload rejects both cases.
+The bundle lists nonempty X.509 certificate chains associated with key entries, indexed by alias. Entries without such a chain are omitted. Key availability and selection still depend on the configured key managers.
+An empty map means no such chains were found, and node reload rejects it. Use `null` when certificate metadata is unknown. Every list in a supplied map must be nonempty.
 
-With automatic renewal enabled, every private key must have a nonempty chain at startup and on each reload. Without renewal, metadata is optional.
+With automatic renewal enabled, the bundle must contain at least one X.509 chain at startup and on each replacement. Without renewal, metadata is optional.
 See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html#createSslBundle()[method contract] for call ordering, concurrent calls and remote request handling.
 
 === Migrating an Existing Factory

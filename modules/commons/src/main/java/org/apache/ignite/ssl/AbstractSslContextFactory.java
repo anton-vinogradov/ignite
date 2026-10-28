@@ -121,8 +121,8 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     /**
      * Sets whether a node calls {@link #createSslBundle()} before the certificates expire to pick up replacements.
      * A file-based factory rereads its files. It does not replace them.
-     * When enabled, the factory must provide at least one private key and a nonempty X.509 chain for every private key, or the node
-     * does not start. Disabled by default.
+     * When enabled, the factory must report at least one X.509 certificate chain, or the node does not start.
+     * Renewal considers all reported chains. Disabled by default.
      * Set this before starting the node; changing it on a running node takes effect after a restart.
      *
      * @param renewalEnabled Whether renewal is enabled.
@@ -138,7 +138,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
 
     /**
      * Sets the share of the certificate lifetime left when a node starts to renew the certificate. The lifetime runs from the time
-     * the leaf certificate becomes valid to the earliest expiry in its chain. For several private keys, the chain with the earliest
+     * the leaf certificate becomes valid to the earliest expiry in its chain. Among the reported chains, the one with the earliest
      * expiry determines renewal; ties use the earliest leaf validity start. The value must be greater than {@code 0} and less than
      * {@code 1}, otherwise this method throws {@link IllegalArgumentException}.
      * If not specified, {@link #DFLT_RENEW_BEFORE_FRACTION} is used.

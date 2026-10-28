@@ -75,6 +75,7 @@ import static org.apache.ignite.ssl.SslTestUtils.reloadFailure;
 import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
+import static org.apache.ignite.testframework.GridTestUtils.assertNotContains;
 import static org.apache.ignite.testframework.TestCertificateAuthority.chain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.context;
 import static org.apache.ignite.testframework.TestCertificateAuthority.keyStoreWithoutCertificateChain;
@@ -87,7 +88,7 @@ import static org.mockito.Mockito.when;
  * {@code --ssl reload} and {@code --ssl status} on running nodes: new connections of every transport get the reloaded certificate,
  * every node logs who reloaded it, a factory is loaded once per reload whatever transports share it, separate factories get
  * providers of their own, and a failing factory does not stop the others. The report, the node log and status show refused
- * reloads; the report shows unavailable nodes and lists failures first; both commands name every key; a node on an invalid
+ * reloads; the report shows unavailable nodes and lists failures first; both commands name each reported chain; a node on an invalid
  * certificate warns and fails status; without SSL both commands say that no factory is configured. The last test replaces the
  * authority of a cluster. A node starts on old-key from old-ca and trusts both authorities unless a test says otherwise; its
  * client connector shares the node factory and asks for no client certificate. Each node reads its own key and trust store
@@ -336,9 +337,9 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
             "\\S+: " + Pattern.quote(reason)).matcher(status).find());
     }
 
-    /** A real PKCS12 replacement with a private key but no certificate chain is refused, and new connections keep the old certificate. */
+    /** Reload refuses a PKCS12 store with no certificate chains, but ignores an entry without a chain when another has one. */
     @Test
-    public void testKeyWithoutCertificateChainNotApplied() throws Exception {
+    public void testReloadRequiresAtLeastOneCertificateChain() throws Exception {
         String name = getTestIgniteInstanceName(0);
         String alias = "key-without-chain";
         String storeType = "PKCS12";
@@ -355,14 +356,26 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         });
         KeyStore replacement = keyStoreWithoutCertificateChain(storeType, alias);
 
-        assertTrue(replacement.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class));
+        assertTrue(replacement.isKeyEntry(alias));
         assertNull(replacement.getCertificateChain(alias));
 
         save(replacement, keyFile(name));
 
-        assertContains(log, reloadFailure(g), "The private key has no X.509 certificate chain; remove the key or provide its " +
-            "X.509 certificate chain [alias=" + alias + ']');
+        assertContains(log, reloadFailure(g),
+            "The new key material has no X.509 certificate chains, so the node would present no certificate");
         assertEquals(oldCert, servedCertificate(context(oldKeys, trustBoth), discoveryPort(g)));
+
+        replacement.setKeyEntry(NEW_KEY, newKeys.getKey(NEW_KEY, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
+            newKeys.getCertificateChain(NEW_KEY));
+
+        save(replacement, keyFile(name));
+        reload(g);
+
+        String report = status(g);
+
+        assertContains(log, report, "loaded alias=" + NEW_KEY + ", subject=CN=" + NEW_KEY);
+        assertNotContains(log, report, "alias=" + alias);
+        assertEquals(newCert, servedCertificate(context(oldKeys, trustBoth), discoveryPort(g)));
     }
 
     /** Both commands report a node that is unavailable when jobs are mapped and still run on the other nodes. */
@@ -412,11 +425,11 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
     }
 
     /**
-     * Reload and status name every private key of the store; for a chain whose authority expires before its leaf, status shows the
+     * Reload and status name every reported chain of the store; for a chain whose authority expires before its leaf, status shows the
      * expiry of the authority.
      */
     @Test
-    public void testReportsNameEveryKey() throws Exception {
+    public void testReportsNameEveryChain() throws Exception {
         // X.509 keeps whole seconds.
         long now = System.currentTimeMillis() / 1000 * 1000;
         long caExpiry = now + HOUR;

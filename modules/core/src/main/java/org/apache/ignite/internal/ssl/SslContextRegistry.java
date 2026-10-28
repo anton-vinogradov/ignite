@@ -108,17 +108,10 @@ public class SslContextRegistry extends GridProcessorAdapter {
             return;
 
         if (chains.isEmpty())
-            U.warn(log, "The key material reports no private-key entries, so the node presents no certificate; " +
+            U.warn(log, "The key material has no X.509 certificate chains, so the node cannot present a certificate; " +
                 "reload rejects such key material");
 
         for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
-            if (entry.getValue().isEmpty()) {
-                U.warn(log, "The private key has no X.509 certificate chain, so the node never presents it; reload rejects " +
-                    "this key store until the key is removed or its X.509 certificate chain is provided [alias=" + entry.getKey() + ']');
-
-                continue;
-            }
-
             X509Certificate invalid = SslCertificates.invalidAt(entry.getValue(), System.currentTimeMillis());
 
             if (invalid != null) {

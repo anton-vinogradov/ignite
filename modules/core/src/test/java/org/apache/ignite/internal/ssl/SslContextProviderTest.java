@@ -138,27 +138,17 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         assertEquals(new ReloadOutcome(recovered.successTime(), 0, null, 0), recovered);
     }
 
-    /**
-     * Key material without a private key, such as a trust store put in place of the key store, or with a private key that has no
-     * X.509 chain is not applied.
-     */
+    /** Key material with no certificate chains, such as a trust store put in place of the key store, is not applied. */
     @Test
-    public void testKeyMaterialWithoutUsableKeyNotApplied() throws Exception {
-        // Aliases are sorted: the "z-" prefix puts the broken key after the valid one, so the check does not stop at the first key.
-        KeyStore valid = ca.keyStoreWithPrivateKey("a-valid");
-        SSLContext ctx = context(valid, ca.trustStore());
+    public void testMaterialWithoutCertificateChainsNotApplied() throws Exception {
         AbstractSslContextFactory f = mock(AbstractSslContextFactory.class);
 
         when(f.createSslBundle()).thenReturn(
             bundle(ca.keyStoreWithPrivateKey("startup"), ca.trustStore()),
-            bundle(ca.trustStore(), ca.trustStore()),
-            new SslBundle(ctx, Map.of("a-valid", chain(valid), "z-no-chain", List.of())));
+            bundle(ca.trustStore(), ca.trustStore()));
 
-        SslContextProvider p = new SslContextProvider(f);
-
-        assertReloadRejected(p, "The new key material reports no private-key entries, so the node would present no certificate");
-        assertReloadRejected(p, "The private key has no X.509 certificate chain; remove the key or provide its X.509 certificate " +
-            "chain [alias=z-no-chain]");
+        assertReloadRejected(new SslContextProvider(f),
+            "The new key material has no X.509 certificate chains, so the node would present no certificate");
     }
 
     /** A context that cannot create an engine, here with a protocol the JVM does not support, is not applied. */
@@ -233,36 +223,24 @@ public class SslContextProviderTest extends GridCommonAbstractTest {
         assertEquals(2, registry.providers().size());
     }
 
-    /**
-     * Registration warns about key material that reload refuses: no private key, here a trust store put in place of the key store,
-     * or a private key without an X.509 chain.
-     */
+    /** Registration warns when the key material has no certificate chains, here a trust store put in place of the key store. */
     @Test
-    public void testRegistryWarnsAboutKeysReloadRefuses() throws Exception {
-        KeyStore valid = ca.keyStoreWithPrivateKey("a-valid");
-        SSLContext ctx = context(valid, ca.trustStore());
-        AbstractSslContextFactory noKey = mock(AbstractSslContextFactory.class);
-        AbstractSslContextFactory noChain = mock(AbstractSslContextFactory.class);
+    public void testRegistryWarnsAboutMissingCertificateChains() throws Exception {
+        AbstractSslContextFactory f = mock(AbstractSslContextFactory.class);
 
-        when(noKey.createSslBundle()).thenReturn(bundle(ca.trustStore(), ca.trustStore()));
-        when(noChain.createSslBundle()).thenReturn(new SslBundle(ctx, Map.of("a-valid", chain(valid), "z-no-chain", List.of())));
+        when(f.createSslBundle()).thenReturn(bundle(ca.trustStore(), ca.trustStore()));
 
         ListeningTestLogger registryLog = new ListeningTestLogger(log);
-        LogListener noKeyWarned = LogListener.matches("The key material reports no private-key entries, " +
-            "so the node presents no certificate; reload rejects such key material").times(1).build();
-        LogListener noChainWarned = LogListener.matches("The private key has no X.509 certificate chain, so the node never presents " +
-            "it; reload rejects this key store until the key is removed or its X.509 certificate chain is provided " +
-            "[alias=z-no-chain]").times(1).build();
+        LogListener warned = LogListener.matches("The key material has no X.509 certificate chains, " +
+            "so the node cannot present a certificate; reload rejects such key material").times(1).build();
 
-        registryLog.registerAllListeners(noKeyWarned, noChainWarned);
+        registryLog.registerListener(warned);
 
         SslContextRegistry registry = new SslContextRegistry(new StandaloneGridKernalContext(registryLog, null));
 
-        registry.register(noKey, CLIENT_CONNECTOR);
-        registry.register(noChain, BINARY_REST);
+        registry.register(f, CLIENT_CONNECTOR);
 
-        assertTrue("No private key", noKeyWarned.check());
-        assertTrue("Key without a chain", noChainWarned.check());
+        assertTrue(warned.check());
     }
 
     /**
