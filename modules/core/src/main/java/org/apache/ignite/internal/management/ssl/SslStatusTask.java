@@ -80,7 +80,7 @@ public class SslStatusTask extends AbstractSslTask {
                 if (chains == null)
                     lines.add(DOUBLE_INDENT + "certificate metadata is unavailable");
                 else if (chains.isEmpty())
-                    lines.add(DOUBLE_INDENT + "no private keys");
+                    lines.add(DOUBLE_INDENT + "no private-key entries reported");
                 else {
                     for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
                         List<X509Certificate> chain = entry.getValue();
