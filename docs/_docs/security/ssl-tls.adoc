@@ -307,7 +307,7 @@ If the source provides a key store, override `loadKeyMaterial()` to return link:
 The base factory builds the context and metadata from the same store load. Keep that store unchanged for as long as a context built from it is in use; load a new store to change certificates.
 To customize key-manager behavior, override `createKeyManagers(KeyMaterial)` and wrap the managers returned by `super.createKeyManagers(material)`. The managers and reported certificate chains must use the same loaded material.
 
-The bundle includes every private-key entry reported by the store, even when the context can choose among several keys.
+The bundle includes the alias and certificate chain of every private-key entry reported by the store, even when the context can choose among several keys.
 An empty map means no private-key entries are reported. An empty list for an alias means its certificate chain is missing or contains a non-X.509 certificate. Node reload rejects both cases.
 See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html#createSslBundle()[method contract] for call ordering, concurrent calls and remote request handling.
 
