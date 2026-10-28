@@ -265,7 +265,7 @@ The delivery system must make a valid replacement available before the window op
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
 With `SslContextFactory`, the key store must contain at least one private-key entry and the complete X.509 chain of every private key. A custom factory must supply at least one chain and include the chain of every private key with each context.
-Without a private-key chain, or if any chain is incomplete, a node with automatic renewal enabled cannot start because it cannot determine when renewal is due.
+A node with automatic renewal enabled cannot start unless the factory reports at least one private-key entry and supplies a nonempty X.509 chain for every reported entry.
 
 Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
 
