@@ -184,7 +184,7 @@ Reload checks the dates of the certificate chains supplied by the factory. If an
 
 A custom factory can return a context without certificate information. Status then reports `certificate metadata is unavailable`, and reload cannot check certificate dates.
 
-With `SslContextFactory`, reload also rejects stores that report no private-key entries or contain a private key without an X.509 certificate chain. The node cannot present a key whose chain is missing or contains a non-X.509 certificate. A node can still start with such a store if automatic renewal is disabled, but it logs a warning. Use the `no private-key entries reported` and `alias=...` rows in link:tools/control-script#checking-certificates[Checking Certificates] to correct the store before running reload.
+With `SslContextFactory`, reload also rejects stores that report no private-key entries or report a private-key entry without an X.509 certificate chain. The node cannot present a key whose chain is missing or contains a non-X.509 certificate. A node can still start with such a store if automatic renewal is disabled, but it logs a warning. Use the `no private-key entries reported` and `alias=...` rows in link:tools/control-script#checking-certificates[Checking Certificates] to correct the store before running reload.
 
 You must check that peers trust the replacement and that protocols, cipher suites and client authentication settings remain compatible. Reload does not test connections or undo a successful replacement if connections later fail.
 
@@ -265,7 +265,7 @@ The delivery system must make a valid replacement available before the window op
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
 With `SslContextFactory`, the key store must contain at least one private-key entry and the complete X.509 chain of every private key. A custom factory must supply at least one chain and include the chain of every private key with each context.
-Without a private-key chain, or if any chain is incomplete, a node with automatic renewal enabled cannot start because it cannot determine when renewal is due.
+A node with automatic renewal enabled cannot start unless the factory reports at least one private-key entry and supplies a nonempty X.509 chain for every reported entry.
 
 Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
 
