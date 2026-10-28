@@ -360,7 +360,9 @@ Nodes call `createSslBundle()` directly; callers using `Factory<SSLContext>` obt
 
 If the source provides a key store, override `loadKeyMaterial()` to return link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/KeyMaterial.html[KeyMaterial] containing that loaded store, its key password and key manager algorithm.
 The base factory builds the context and metadata from the same store load. Keep that store unchanged for as long as a context built from it is in use; load a new store to change certificates.
-To customize key-manager behavior, override `createKeyManagers(KeyMaterial)` and wrap the managers returned by `super.createKeyManagers(material)`. The managers and reported certificate chains must use the same loaded material.
+
+To use custom key managers, override `createSslBundle()` to initialize a fresh `SSLContext` with those managers and return it with matching certificate metadata in an `SslBundle`.
+The override must configure the context's trust managers and TLS settings as well. Load the material once so that the context and reported chains describe the same certificates.
 
 The bundle lists nonempty X.509 certificate chains associated with key entries, indexed by alias. Entries without such a chain are omitted. Key availability and selection still depend on the configured key managers.
 An empty map means no such chains were found, and node reload rejects it. Use `null` when certificate metadata is unknown. Every list in a supplied map must be nonempty.
@@ -372,8 +374,8 @@ See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ign
 
 The protected `sslCtx` cache and the no-argument `createKeyManagers()` hook have been removed, and `create()` is now final. Update affected subclasses and recompile before upgrading:
 
-* Move store loading from `createKeyManagers()` into `loadKeyMaterial()`, returning the loaded store and its settings. Move key-manager customization into `createKeyManagers(KeyMaterial)`.
-* Remove `create()` overrides. Move store loading into `loadKeyMaterial()`. If the override customizes an already built context, perform that customization in `createSslBundle()` after calling `super.createSslBundle()`, and retain its certificate chains in the returned bundle.
+* Move custom store loading into `loadKeyMaterial()`, returning the loaded store and its settings. If the old `createKeyManagers()` override customizes key managers, build the context in `createSslBundle()` and return matching certificate metadata with it.
+* Remove `create()` overrides. If the override customizes an already built context, perform that customization in `createSslBundle()` after calling `super.createSslBundle()`, and retain its certificate chains in the returned bundle.
 * Move any context caching needed by an external caller into that caller. The node keeps the current bundle and replaces it on reload.
 
 A subclass that only overrides `SslContextFactory.loadKeyStore()` can keep that override as long as it returns a loaded store, never `null`. For a client context without private keys, return an empty loaded store.
