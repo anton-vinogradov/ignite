@@ -75,6 +75,7 @@ import static org.apache.ignite.ssl.SslTestUtils.reloadFailure;
 import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.ssl.SslTestUtils.status;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
+import static org.apache.ignite.testframework.GridTestUtils.assertNotContains;
 import static org.apache.ignite.testframework.TestCertificateAuthority.chain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.context;
 import static org.apache.ignite.testframework.TestCertificateAuthority.keyStoreWithoutCertificateChain;
@@ -336,9 +337,9 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
             "\\S+: " + Pattern.quote(reason)).matcher(status).find());
     }
 
-    /** A real PKCS12 replacement with a private key but no certificate chain is refused, and new connections keep the old certificate. */
+    /** Reload refuses a PKCS12 store with no certificate chains, but ignores an entry without a chain when another has one. */
     @Test
-    public void testKeyWithoutCertificateChainNotApplied() throws Exception {
+    public void testReloadRequiresAtLeastOneCertificateChain() throws Exception {
         String name = getTestIgniteInstanceName(0);
         String alias = "key-without-chain";
         String storeType = "PKCS12";
@@ -355,14 +356,26 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
         });
         KeyStore replacement = keyStoreWithoutCertificateChain(storeType, alias);
 
-        assertTrue(replacement.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class));
+        assertTrue(replacement.isKeyEntry(alias));
         assertNull(replacement.getCertificateChain(alias));
 
         save(replacement, keyFile(name));
 
-        assertContains(log, reloadFailure(g), "The private key has no X.509 certificate chain; remove the key or provide its " +
-            "X.509 certificate chain [alias=" + alias + ']');
+        assertContains(log, reloadFailure(g),
+            "The new key material has no X.509 certificate chains, so the node would present no certificate");
         assertEquals(oldCert, servedCertificate(context(oldKeys, trustBoth), discoveryPort(g)));
+
+        replacement.setKeyEntry(NEW_KEY, newKeys.getKey(NEW_KEY, TestCertificateAuthority.PWD), TestCertificateAuthority.PWD,
+            newKeys.getCertificateChain(NEW_KEY));
+
+        save(replacement, keyFile(name));
+        reload(g);
+
+        String report = status(g);
+
+        assertContains(log, report, "loaded alias=" + NEW_KEY + ", subject=CN=" + NEW_KEY);
+        assertNotContains(log, report, "alias=" + alias);
+        assertEquals(newCert, servedCertificate(context(oldKeys, trustBoth), discoveryPort(g)));
     }
 
     /** Both commands report a node that is unavailable when jobs are mapped and still run on the other nodes. */
