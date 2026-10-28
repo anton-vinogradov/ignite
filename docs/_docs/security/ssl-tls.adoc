@@ -183,7 +183,9 @@ Reload checks the dates of the certificate chains supplied by the factory. If an
 
 A custom factory can return a context without certificate information. Status then reports `certificate metadata is unavailable`, and reload cannot check certificate dates.
 
-With `SslContextFactory`, reload also rejects stores that report no private-key entries or report a private-key entry without an X.509 certificate chain. The node cannot present a key whose chain is missing or contains a non-X.509 certificate. A node can still start with such a store, but it logs a warning. Use the `no private-key entries reported` and `alias=...` rows in link:tools/control-script#checking-certificates[Checking Certificates] to correct the store before running reload.
+With `SslContextFactory`, status lists only keys with a nonempty X.509 certificate chain. Keys without a chain, or whose chain contains a non-X.509 certificate, are omitted. After reload, check that every alias you expect appears in status.
+
+Reload also rejects a replacement with no X.509 certificate chains. A node can still start with such a store, but it logs a warning. Follow the `no X.509 certificate chains` row in link:tools/control-script#checking-certificates[Checking Certificates] to correct the store before running reload.
 
 You must check that peers trust the replacement and that protocols, cipher suites and client authentication settings remain compatible. Reload does not test connections or undo a successful replacement if connections later fail.
 
@@ -299,7 +301,7 @@ Reload leaves existing connections open. After preventing new connections with t
 This section is for developers integrating a certificate source, such as a PKI service.
 
 To support reload with certificate status, extend link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html[AbstractSslContextFactory].
-Its `createSslBundle()` method builds a fresh link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/SslBundle.html[SslBundle] containing the initialized context and the certificate chains loaded with it, indexed by private-key alias.
+Its `createSslBundle()` method builds a fresh link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/SslBundle.html[SslBundle] containing the initialized context and the certificate chains loaded with it, indexed by key alias.
 The final `create()` method returns `createSslBundle().context()`: each call creates a new context, with no cache in the factory.
 Nodes call `createSslBundle()` directly; callers using `Factory<SSLContext>` obtain its context through `create()`.
 
@@ -307,8 +309,8 @@ If the source provides a key store, override `loadKeyMaterial()` to return link:
 The base factory builds the context and metadata from the same store load. Keep that store unchanged for as long as a context built from it is in use; load a new store to change certificates.
 To customize key-manager behavior, override `createKeyManagers(KeyMaterial)` and wrap the managers returned by `super.createKeyManagers(material)`. The managers and reported certificate chains must use the same loaded material.
 
-The bundle includes the alias and certificate chain of every private-key entry reported by the store, even when the context can choose among several keys.
-An empty map means no private-key entries are reported. An empty list for an alias means its certificate chain is missing or contains a non-X.509 certificate. Node reload rejects both cases.
+The bundle lists nonempty X.509 certificate chains associated with key entries, indexed by alias. Entries without such a chain are omitted. Key availability and selection still depend on the configured key managers.
+An empty map means no such chains were found, and node reload rejects it. Use `null` when certificate metadata is unknown. Every list in a supplied map must be nonempty.
 See the link:https://ignite.apache.org/releases/{version}/javadoc/org/apache/ignite/ssl/AbstractSslContextFactory.html#createSslBundle()[method contract] for call ordering, concurrent calls and remote request handling.
 
 === Migrating an Existing Factory

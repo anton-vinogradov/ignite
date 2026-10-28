@@ -84,7 +84,7 @@ public class SslContextProvider {
         return String.join(", ", transports);
     }
 
-    /** @return Chains by private-key alias, or {@code null} when the factory supplies no metadata. */
+    /** @return Chains by key alias, or {@code null} when the factory supplies no metadata. */
     public @Nullable Map<String, List<X509Certificate>> certificateChains() {
         return bundle.certificateChains();
     }
@@ -95,9 +95,8 @@ public class SslContextProvider {
     }
 
     /**
-     * Builds and installs a new context for new connections, recording success or failure. Rejects key material that reports no
-     * private-key entries or contains a private key without an X.509 certificate chain. Every supplied certificate must be within its
-     * validity period.
+     * Builds and installs a new context for new connections, recording success or failure. Rejects material known to have no
+     * X.509 certificate chains. Every supplied certificate must be within its validity period.
      * The administrator must ensure that peers trust the new certificates and can connect with the new context.
      *
      * @return Context and certificate metadata installed by this reload.
@@ -129,36 +128,19 @@ public class SslContextProvider {
 
     /**
      * @return Bundle built anew, or the context in use if a custom factory caches it.
-     * @throws IgniteCheckedException If the loaded material reports no private-key entries or a key has no X.509 certificate chain.
+     * @throws IgniteCheckedException If the loaded material has no X.509 certificate chains.
      */
     private SslBundle build() throws IgniteCheckedException {
         SslBundle rebuilt = createBundle();
+        Map<String, List<X509Certificate>> chains = rebuilt.certificateChains();
 
-        checkKeyMaterial(rebuilt.certificateChains());
+        if (chains != null && chains.isEmpty())
+            throw new IgniteCheckedException("The new key material has no X.509 certificate chains, " +
+                "so the node would present no certificate");
 
         rebuilt.context().createSSLEngine();
 
         return rebuilt;
-    }
-
-    /**
-     * @param chains Chains by private-key alias, {@code null} if the factory supplies no metadata.
-     * @throws IgniteCheckedException If no private-key entries are reported or a key has no X.509 certificate chain.
-     */
-    private static void checkKeyMaterial(@Nullable Map<String, List<X509Certificate>> chains) throws IgniteCheckedException {
-        if (chains == null)
-            return;
-
-        if (chains.isEmpty())
-            throw new IgniteCheckedException("The new key material reports no private-key entries, " +
-                "so the node would present no certificate");
-
-        for (Map.Entry<String, List<X509Certificate>> entry : chains.entrySet()) {
-            if (entry.getValue().isEmpty()) {
-                throw new IgniteCheckedException("The private key has no X.509 certificate chain; remove the key or provide its " +
-                    "X.509 certificate chain [alias=" + entry.getKey() + ']');
-            }
-        }
     }
 
     /**

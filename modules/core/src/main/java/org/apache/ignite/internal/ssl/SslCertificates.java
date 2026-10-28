@@ -69,7 +69,7 @@ public class SslCertificates {
     }
 
     /**
-     * @param chains Chains by private-key alias, or {@code null} when metadata is unavailable.
+     * @param chains Nonempty chains by key alias, or {@code null} when metadata is unavailable.
      * @return Description of every alias and its leaf certificate, or an empty string if the aliases are unknown.
      */
     public static String describeChains(@Nullable Map<String, List<X509Certificate>> chains) {
@@ -78,8 +78,7 @@ public class SslCertificates {
 
         List<String> descriptions = new ArrayList<>();
 
-        chains.forEach((alias, chain) -> descriptions.add("alias=" + alias + ", " +
-            (chain.isEmpty() ? "certificate chain is absent or is not X.509" : describe(chain.get(0)))));
+        chains.forEach((alias, chain) -> descriptions.add("alias=" + alias + ", " + describe(chain.get(0))));
 
         return String.join("; ", descriptions);
     }
