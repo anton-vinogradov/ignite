@@ -260,16 +260,17 @@ For manual file replacement, use <<Upgrading Certificates>> and run reload after
 
 === Prepare Certificate Delivery
 
-Renewal follows the first certificate to expire across all private-key chains, including CA certificates.
+Renewal follows the first certificate to expire across the TLS certificate chains loaded by the factory, including CA certificates.
 For that chain, the renewal window is the last share of its lifetime set by the factory property `renewBeforeFraction`. The lifetime runs from the leaf certificate's start date to the earliest expiry in the chain. Ignite starts trying to load replacement certificates when the renewal window opens. If several chains expire at exactly the same time, renewal starts when the first of their windows opens.
 
 The delivery system must make a valid replacement available before the window opens. Ignite reads the files at each scheduled attempt, not when they change.
 The replacement must move that earliest expiry forward. Renewing only one key is insufficient if another chain still expires at the original time. If a CA certificate expires first, replace it too.
 
-With `SslContextFactory`, the key store must contain at least one private-key entry and the complete X.509 chain of every private key. A custom factory must supply at least one chain and include the chain of every private key with each context.
-A node with automatic renewal enabled cannot start unless the factory reports at least one private-key entry and supplies a nonempty X.509 chain for every reported entry.
+Provide at least one private key with its X.509 certificate chain. `SslContextFactory` ignores entries whose chains are missing, empty or contain a non-X.509 certificate. A custom factory must supply the TLS certificate chains used by its context.
+A node with automatic renewal enabled cannot start if the factory supplies no chains or cannot report them.
 
 Ignite replaces the entire context at once. All replacement chains must be valid, but their aliases need not match the old ones.
+If an entry loses its X.509 chain, it is treated as removed. The remaining chains must still advance the earliest expiry for renewal to apply the replacement.
 
 Nodes and applications must trust the replacement certificates before they are loaded. For a new CA, follow the stages in <<Upgrading Certificates>>.
 When renewal installs a replacement certificate, `SslContextFactory` also reloads its trust store. Keep the old CA in the trust store until every affected node and application has switched certificates. Otherwise, the renewed node cannot connect to nodes that still use certificates from the old CA. To apply a trust store change without replacing the certificate, run `control.sh --ssl reload`.

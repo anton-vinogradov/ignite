@@ -122,7 +122,7 @@ public class SslRenewalNodeTest extends GridCommonAbstractTest {
 
         GridTestUtils.assertThrowsAnyCause(log, () -> startGrid(0, cfg -> {
             cfg.setSslContextFactory(factory);
-        }), IgniteException.class, "The SSL context factory must provide a nonempty certificate chain for every private key");
+        }), IgniteException.class, "The SSL context factory must provide at least one X.509 certificate chain");
     }
 
     /**

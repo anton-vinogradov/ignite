@@ -161,6 +161,23 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(Map.of("new-1", chain(new1), "new-2", chain(new2)), p.certificateChains());
     }
 
+    /** Removing the first-expiring chain advances the earliest expiry when the remaining chain expires later. */
+    @Test
+    public void testRenewalCanRemoveEarliestChain() throws Exception {
+        long now = System.currentTimeMillis();
+        KeyStore removed = ca.keyStoreWithPrivateKey("removed", now - HOUR, now + HOUR);
+        KeyStore remaining = ca.keyStoreWithPrivateKey("remaining", now - HOUR, now + 2 * HOUR);
+        SslBundle replacement = bundle(remaining, ca.trustStore());
+        AbstractSslContextFactory f = renewingFactory(QUARTER);
+
+        when(f.createSslBundle()).thenReturn(bundle(merged(removed, remaining), ca.trustStore()), replacement);
+
+        SslContextProvider p = new SslContextProvider(f);
+
+        assertSame(replacement, p.renew(p.context()));
+        assertEquals(Map.of("remaining", chain(remaining)), p.certificateChains());
+    }
+
     /** renew replaces an expired certificate in use with a valid one. */
     @Test
     public void testExpiredCertificateRenewed() throws Exception {
@@ -179,7 +196,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertEquals(Map.of("valid", chain(valid)), p.certificateChains());
     }
 
-    /** renew applies the checks of reload: here a candidate without a private key and one that is not valid yet are refused. */
+    /** renew applies the checks of reload: here a candidate without certificate chains and one that is not valid yet are refused. */
     @Test
     public void testRenewalAppliesReloadChecks() throws Exception {
         long now = System.currentTimeMillis();
@@ -192,8 +209,8 @@ public class SslRenewalTest extends GridCommonAbstractTest {
 
         SslContextProvider p = new SslContextProvider(f);
 
-        assertRenewalRejected("No private key", p,
-            "The new key material reports no private-key entries, so the node would present no certificate");
+        assertRenewalRejected("No certificate chains", p,
+            "The new key material has no X.509 certificate chains, so the node would present no certificate");
         assertRenewalRejected("Not valid yet", p, "The new certificate chain is not valid now [alias=not-yet-valid, ");
     }
 
@@ -344,7 +361,7 @@ public class SslRenewalTest extends GridCommonAbstractTest {
      */
     @Test
     public void testReloadCannotLoseMetadataWithRenewal() throws Exception {
-        String reason = "The new SSL context must provide a nonempty certificate chain for every private key to renew automatically";
+        String reason = "The new SSL context must provide at least one X.509 certificate chain to renew automatically";
         SslBundle startup = bundle(ca.keyStoreWithPrivateKey("startup"), ca.trustStore());
         SslBundle unknown = new SslBundle(context(ca.keyStoreWithPrivateKey("unknown"), ca.trustStore()), null);
         AbstractSslContextFactory f = renewingFactory(QUARTER);
@@ -361,31 +378,23 @@ public class SslRenewalTest extends GridCommonAbstractTest {
         assertRenewalRejected("Renewal", p, reason);
     }
 
-    /** Renewal does not start without a nonempty chain for every private key: no metadata, no private key, a key without a chain. */
+    /** Renewal does not start when certificate metadata is unknown or contains no chains. */
     @Test
     public void testRenewalRefusedToStartWithoutChains() throws Exception {
-        KeyStore valid = ca.keyStoreWithPrivateKey("a-valid");
-        SSLContext ctx = context(valid, ca.trustStore());
+        SSLContext ctx = context(ca.keyStoreWithPrivateKey(), ca.trustStore());
         AbstractSslContextFactory unknown = renewingFactory(QUARTER);
-        AbstractSslContextFactory noKey = renewingFactory(QUARTER);
-        AbstractSslContextFactory noChain = renewingFactory(QUARTER);
+        AbstractSslContextFactory noChains = renewingFactory(QUARTER);
         RecordingExecutor exec = new RecordingExecutor();
+        String reason = "The SSL context factory must provide at least one X.509 certificate chain to renew automatically";
 
         when(unknown.createSslBundle()).thenReturn(new SslBundle(ctx, null));
-        when(noKey.createSslBundle()).thenReturn(bundle(ca.trustStore(), ca.trustStore()));
-        // Aliases are sorted, so "z-" puts the key without a chain after a valid one: the check must go past the first key.
-        when(noChain.createSslBundle()).thenReturn(new SslBundle(ctx, Map.of("a-valid", chain(valid), "z-no-chain", List.of())));
+        when(noChains.createSslBundle()).thenReturn(bundle(ca.trustStore(), ca.trustStore()));
 
         SslContextProvider unknownProvider = new SslContextProvider(unknown);
-        SslContextProvider noKeyProvider = new SslContextProvider(noKey);
-        SslContextProvider noChainProvider = new SslContextProvider(noChain);
+        SslContextProvider noChainsProvider = new SslContextProvider(noChains);
 
-        GridTestUtils.assertThrows(log, () -> unknownProvider.startRenewal(exec, renewalLog), IgniteException.class,
-            "The SSL context factory must provide a nonempty certificate chain for every private key to renew automatically");
-        GridTestUtils.assertThrows(log, () -> noKeyProvider.startRenewal(exec, renewalLog), IgniteException.class,
-            "The new key material reports no private-key entries, so the node would present no certificate");
-        GridTestUtils.assertThrows(log, () -> noChainProvider.startRenewal(exec, renewalLog), IgniteException.class,
-            "The private key has no X.509 certificate chain; remove the key or provide its X.509 certificate chain [alias=z-no-chain]");
+        GridTestUtils.assertThrows(log, () -> unknownProvider.startRenewal(exec, renewalLog), IgniteException.class, reason);
+        GridTestUtils.assertThrows(log, () -> noChainsProvider.startRenewal(exec, renewalLog), IgniteException.class, reason);
     }
 
     /** Both the chains in use and a factory failure count as unsuccessful renewals, and a renewal clears the count. */
