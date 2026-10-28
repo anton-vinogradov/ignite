@@ -88,7 +88,7 @@ import static org.mockito.Mockito.when;
  * {@code --ssl reload} and {@code --ssl status} on running nodes: new connections of every transport get the reloaded certificate,
  * every node logs who reloaded it, a factory is loaded once per reload whatever transports share it, separate factories get
  * providers of their own, and a failing factory does not stop the others. The report, the node log and status show refused
- * reloads; the report shows unavailable nodes and lists failures first; both commands name every key; a node on an invalid
+ * reloads; the report shows unavailable nodes and lists failures first; both commands name each reported chain; a node on an invalid
  * certificate warns and fails status; without SSL both commands say that no factory is configured. The last test replaces the
  * authority of a cluster. A node starts on old-key from old-ca and trusts both authorities unless a test says otherwise; its
  * client connector shares the node factory and asks for no client certificate. Each node reads its own key and trust store
@@ -425,11 +425,11 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
     }
 
     /**
-     * Reload and status name every private key of the store; for a chain whose authority expires before its leaf, status shows the
+     * Reload and status name every reported chain of the store; for a chain whose authority expires before its leaf, status shows the
      * expiry of the authority.
      */
     @Test
-    public void testReportsNameEveryKey() throws Exception {
+    public void testReportsNameEveryChain() throws Exception {
         // X.509 keeps whole seconds.
         long now = System.currentTimeMillis() / 1000 * 1000;
         long caExpiry = now + HOUR;
