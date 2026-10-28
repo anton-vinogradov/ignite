@@ -295,7 +295,8 @@ public class SslContextProvider {
         Map<String, List<X509Certificate>> chains = next.certificateChains();
 
         if (requireChains && (chains == null || chains.isEmpty()))
-            throw new IgniteCheckedException("The new SSL context must provide at least one X.509 certificate chain to renew automatically");
+            throw new IgniteCheckedException("The new SSL context must provide at least one X.509 certificate chain " +
+                "to renew automatically");
 
         if (chains == null)
             return;
