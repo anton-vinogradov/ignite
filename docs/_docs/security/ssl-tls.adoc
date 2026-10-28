@@ -62,7 +62,7 @@ tab:C#/.NET[]
 tab:C++[unsupported]
 --
 
-The keystore must contain the node's certificate and private key. For automatic renewal, include the X.509 chain of every private key.
+The keystore must contain the node's certificate and private key.
 
 The trust store defines which peer certificates the node accepts. Configure trust on all nodes and clients before replacing certificates.
 

@@ -288,7 +288,8 @@ public class SslContextProvider {
     /**
      * @param next Bundle loaded by the factory.
      * @param requireChains Whether at least one reported chain is required for renewal.
-     * @throws IgniteCheckedException If required certificate metadata is unknown or empty, or a certificate is outside its validity period.
+     * @throws IgniteCheckedException If required certificate metadata is unknown or empty,
+     *      or a certificate is outside its validity period.
      */
     private void check(SslBundle next, boolean requireChains) throws IgniteCheckedException {
         Map<String, List<X509Certificate>> chains = next.certificateChains();
