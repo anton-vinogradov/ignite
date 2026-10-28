@@ -350,7 +350,9 @@ public class SslContextReloadTest extends GridCommonAbstractTest {
 
         save(startupKeys, keyFile(name));
 
-        IgniteEx g = startGrid(0, cfg -> ((SslContextFactory)cfg.getSslContextFactory()).setKeyStoreType(storeType));
+        IgniteEx g = startGrid(0, cfg -> {
+            ((SslContextFactory)cfg.getSslContextFactory()).setKeyStoreType(storeType);
+        });
         KeyStore replacement = keyStoreWithoutCertificateChain(storeType, alias);
 
         assertTrue(replacement.entryInstanceOf(alias, KeyStore.PrivateKeyEntry.class));
