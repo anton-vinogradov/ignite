@@ -57,7 +57,8 @@ import static org.mockito.Mockito.when;
 /**
  * What {@link SslContextProvider#reload()} puts in use and records, what it refuses; the registry keeps one provider per factory
  * object and warns at registration about key material that reload refuses. Reload refusals follow the order of the checks in the
- * code: usable keys, an engine from the new context, a context not in use, certificates valid now.
+ * code: nonempty X.509 chains when metadata is available, an engine from the new context, a context not in use,
+ * certificates valid now.
  */
 public class SslContextProviderTest extends GridCommonAbstractTest {
     /** */
