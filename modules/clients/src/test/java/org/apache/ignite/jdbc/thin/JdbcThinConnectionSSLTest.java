@@ -642,9 +642,7 @@ public class JdbcThinConnectionSSLTest extends JdbcThinAbstractSelfTest {
         }
     }
 
-    /**
-     * @throws Exception If failed.
-     */
+    /** An unsupported key-manager algorithm is reported together with the affected key store. */
     @Test
     public void testInvalidKeyAlgorithm() throws Exception {
         setSslCtxFactoryToCli = true;
@@ -653,7 +651,7 @@ public class JdbcThinConnectionSSLTest extends JdbcThinAbstractSelfTest {
         startGrids(1);
 
         try {
-            GridTestUtils.assertThrows(log, new Callable<Object>() {
+            Throwable err = GridTestUtils.assertThrows(log, new Callable<Object>() {
                 @Override public Object call() throws Exception {
                     Connection c = DriverManager.getConnection("jdbc:ignite:thin://127.0.0.1/?sslMode=require" +
                         "&sslKeyAlgorithm=INVALID" +
@@ -665,6 +663,8 @@ public class JdbcThinConnectionSSLTest extends JdbcThinAbstractSelfTest {
                     return null;
                 }
             }, SQLException.class, "Unsupported key algorithm: INVALID");
+
+            assertTrue(err.getMessage().contains("keyStoreFile=" + CLI_KEY_STORE_PATH));
         }
         finally {
             stopAllGrids();
