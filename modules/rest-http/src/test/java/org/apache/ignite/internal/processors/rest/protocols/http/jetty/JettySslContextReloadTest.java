@@ -116,8 +116,8 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     }
 
     /**
-     * Reload reports HTTP REST, a new connection gets the new certificate although its client offers the TLS session of an earlier
-     * connection, and a connection opened before reload keeps working. The request names the host by an IP address that no
+     * Reload reports HTTP REST, and a new connection using the same client context gets the new certificate.
+     * A connection opened before reload keeps working. The request names the host by an IP address that no
      * certificate contains.
      */
     @Test
@@ -126,7 +126,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         IgniteEx g = startGrid(0, cfg -> {
             cfg.setConnectorConfiguration(new ConnectorConfiguration().setHttpSslFactory(factory()));
         });
-        // After the response on the open connection, the client offers its session on the next connection; the server must not resume it.
+        // Use the same client context for the connection opened before reload and the new connection.
         SSLContext client = clientContext(null, trustBoth);
 
         try (SSLSocket open = socket(client, port(g))) {
