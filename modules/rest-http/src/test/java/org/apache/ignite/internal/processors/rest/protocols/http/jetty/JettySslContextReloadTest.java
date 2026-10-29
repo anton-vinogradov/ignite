@@ -126,7 +126,6 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         IgniteEx g = startGrid(0, cfg -> {
             cfg.setConnectorConfiguration(new ConnectorConfiguration().setHttpSslFactory(factory()));
         });
-        // Use the same client context for the connection opened before reload and the new connection.
         SSLContext client = clientContext(null, trustBoth);
 
         try (SSLSocket open = socket(client, port(g))) {
