@@ -24,15 +24,23 @@ import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
+import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSocket;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.configuration.ConnectorConfiguration;
 import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.internal.processors.rest.GridRestProtocol;
+import org.apache.ignite.internal.ssl.SslContextProvider;
 import org.apache.ignite.internal.util.typedef.internal.U;
+import org.apache.ignite.ssl.KeyMaterial;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.TestCertificateAuthority;
@@ -43,6 +51,8 @@ import org.eclipse.jetty.server.SslConnectionFactory;
 import org.junit.Test;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.util.concurrent.TimeUnit.HOURS;
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static org.apache.ignite.internal.IgniteNodeAttributes.ATTR_REST_JETTY_PORT;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.HTTP_REST;
 import static org.apache.ignite.ssl.SslTestUtils.assertClientAuthentication;
@@ -51,13 +61,14 @@ import static org.apache.ignite.ssl.SslTestUtils.node;
 import static org.apache.ignite.ssl.SslTestUtils.reload;
 import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
+import static org.apache.ignite.testframework.GridTestUtils.waitForCondition;
 import static org.apache.ignite.testframework.TestCertificateAuthority.PWD;
 import static org.apache.ignite.testframework.TestCertificateAuthority.chain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.save;
 import static org.junit.Assert.assertArrayEquals;
 
 /**
- * HTTPS of HTTP REST set up with {@link ConnectorConfiguration#setHttpSslFactory}: reload, client authentication, TLS parameters,
+ * HTTPS of HTTP REST set up with {@link ConnectorConfiguration#setHttpSslFactory}: reload, renewal, client authentication, TLS parameters,
  * Jetty XML connectors and refused configurations. HTTP REST starts on old-key from old-ca and trusts both authorities unless a test
  * says otherwise; probes trust both authorities and present no client certificate unless a test needs one.
  */
@@ -138,6 +149,76 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         }
 
         assertEquals(chain(newKeys).get(0), servedCertificate(client, port(g)));
+    }
+
+    /** Automatic renewal of an HTTP-only factory replaces the full certificate chain served on new HTTPS connections. */
+    @Test
+    public void testHttpsGetsAutomaticallyRenewedChain() throws Exception {
+        long now = System.currentTimeMillis();
+        long hour = HOURS.toMillis(1);
+        String newAlias = "renewed";
+        KeyStore oldKeys = oldCa.keyStoreWithPrivateKey(OLD_KEY, now - hour, now + MINUTES.toMillis(10));
+        KeyStore newKeys = newCa.keyStoreWithPrivateKey(newAlias, now, now + hour);
+        List<X509Certificate> newChain = chain(newKeys);
+        CountDownLatch replacementReady = new CountDownLatch(1);
+        AtomicBoolean firstLoad = new AtomicBoolean(true);
+        SslContextFactory factory = factory(new SslContextFactory() {
+            /** {@inheritDoc} */
+            @Override protected KeyMaterial loadKeyMaterial() throws SSLException {
+                // Start with the old file; let the scheduled attempt read only after the replacement is ready.
+                if (!firstLoad.getAndSet(false)) {
+                    try {
+                        replacementReady.await();
+                    }
+                    catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+
+                        throw new SSLException(e);
+                    }
+                }
+
+                return super.loadKeyMaterial();
+            }
+        });
+
+        // The old certificate is past half its lifetime; the replacement is not.
+        factory.setRenewBeforeFraction(0.5);
+        factory.setRenewalEnabled(true);
+        save(oldKeys, keyFile);
+
+        try {
+            IgniteEx g = startGrid(0, cfg -> {
+                cfg.setConnectorConfiguration(new ConnectorConfiguration().setHttpSslFactory(factory));
+            });
+            SSLContext client = clientContext(null, trustBoth);
+            Collection<SslContextProvider> providers = g.context().sslContexts().providers();
+
+            assertEquals(1, providers.size());
+
+            SslContextProvider provider = providers.iterator().next();
+
+            try (SSLSocket sock = socket(client, port(g))) {
+                sock.startHandshake();
+
+                assertArrayEquals(chain(oldKeys).toArray(), sock.getSession().getPeerCertificates());
+                assertEquals(200, versionStatus(sock, OLD_KEY));
+            }
+
+            save(newKeys, keyFile);
+            replacementReady.countDown();
+
+            assertTrue(waitForCondition(() -> Map.of(newAlias, newChain).equals(provider.certificateChains()), 10_000));
+
+            try (SSLSocket sock = socket(client, port(g))) {
+                sock.startHandshake();
+
+                assertArrayEquals(newChain.toArray(), sock.getSession().getPeerCertificates());
+                assertEquals(200, versionStatus(sock, newAlias));
+            }
+        }
+        finally {
+            replacementReady.countDown();
+        }
     }
 
     /** With client authentication, HTTP REST accepts a client of the authority it trusts now and refuses one it trusted before reload. */
@@ -257,8 +338,14 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
 
     /** @return Factory reading {@link #keyFile} and {@link #trustFile}. */
     private SslContextFactory factory() {
-        SslContextFactory factory = new SslContextFactory();
+        return factory(new SslContextFactory());
+    }
 
+    /**
+     * @param factory Factory to configure.
+     * @return The factory, reading {@link #keyFile} and {@link #trustFile}.
+     */
+    private SslContextFactory factory(SslContextFactory factory) {
         factory.setKeyStoreType("JKS");
         factory.setKeyStoreFilePath(keyFile.toString());
         factory.setKeyStorePassword(PWD);

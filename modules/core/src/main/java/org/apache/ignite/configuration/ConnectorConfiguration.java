@@ -527,8 +527,8 @@ public class ConnectorConfiguration {
 
     /**
      * Sets the SSL context factory for HTTP REST. HTTP REST then serves HTTPS with the certificates of this factory.
-     * {@code control.sh --ssl reload} and {@code --ssl status} cover these certificates like those of the other transports of the node.
-     * Protocols and cipher suites come from the factory, except the cipher suites Jetty turns off by default.
+     * {@code control.sh --ssl reload}, {@code --ssl status} and automatic renewal cover these certificates like those of the other
+     * transports of the node. Protocols and cipher suites come from the factory, except the cipher suites Jetty turns off by default.
      * Client authentication comes from {@link #setHttpSslClientAuth(boolean)}.
      * <p>
      * Ignite adds TLS to the built-in Jetty connector or to the connector from the Jetty XML file that {@link #setJettyPath(String)}
