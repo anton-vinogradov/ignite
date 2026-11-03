@@ -40,7 +40,7 @@ import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.internal.processors.rest.GridRestProtocol;
 import org.apache.ignite.internal.ssl.SslContextProvider;
 import org.apache.ignite.internal.util.typedef.internal.U;
-import org.apache.ignite.ssl.KeyMaterial;
+import org.apache.ignite.ssl.SslBundle;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.TestCertificateAuthority;
@@ -160,6 +160,8 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
     /** Automatic renewal of an HTTP-only factory replaces the full certificate chain served on new HTTPS connections. */
     @Test
     public void testHttpsGetsAutomaticallyRenewedChain() throws Exception {
+        prepareStores();
+
         long now = System.currentTimeMillis();
         long hour = HOURS.toMillis(1);
         String newAlias = "renewed";
@@ -170,7 +172,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         AtomicBoolean firstLoad = new AtomicBoolean(true);
         SslContextFactory factory = factory(new SslContextFactory() {
             /** {@inheritDoc} */
-            @Override protected KeyMaterial loadKeyMaterial() throws SSLException {
+            @Override protected SslBundle createSslBundle() throws SSLException {
                 // Start with the old file; let the scheduled attempt read only after the replacement is ready.
                 if (!firstLoad.getAndSet(false)) {
                     try {
@@ -183,7 +185,7 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
                     }
                 }
 
-                return super.loadKeyMaterial();
+                return super.createSslBundle();
             }
         });
 
