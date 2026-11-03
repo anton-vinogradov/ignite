@@ -26,14 +26,18 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.crypto.KeyGenerator;
+import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509KeyManager;
 import org.apache.ignite.IgniteException;
+import org.apache.ignite.internal.IgniteInternalFuture;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.TestCertificateAuthority;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
@@ -42,12 +46,14 @@ import org.junit.Test;
 import static org.apache.ignite.testframework.TestCertificateAuthority.PWD;
 import static org.apache.ignite.testframework.TestCertificateAuthority.chain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.keyStoreWithoutCertificateChain;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 
 /**
  * Factory initialization publishes a context and metadata from one store read; failed initialization preserves the previous
- * bundle. Reading the accepted bundle or context does not reload stores. {@link KeyMaterial} reports nonempty X.509 chains
- * without recovering keys and keeps its own key password. {@link SslBundle} keeps sorted immutable metadata, or {@code null}.
+ * bundle. Reading the accepted bundle or context does not reload stores. {@link KeyMaterial} initializes key managers and
+ * reports nonempty X.509 chains. {@link SslBundle} keeps sorted immutable metadata, or {@code null}.
  */
 public class SslContextMetadataTest extends GridCommonAbstractTest {
     /** Authority that signs the test certificates. */
@@ -70,7 +76,8 @@ public class SslContextMetadataTest extends GridCommonAbstractTest {
         assertSame(firstBundle, factory.sslBundle());
         assertEquals(Map.of("first", chain(first)), firstBundle.certificateChains());
 
-        SSLContext shared = factory.create();
+        assertSame(firstBundle.context(), factory.create());
+
         KeyStore second = ca.keyStoreWithPrivateKey("second");
 
         factory.store = second;
@@ -82,7 +89,7 @@ public class SslContextMetadataTest extends GridCommonAbstractTest {
         assertEquals(Map.of("second", chain(second)), secondBundle.certificateChains());
         assertEquals(Map.of("first", chain(first)), firstBundle.certificateChains());
         assertNotSame(firstBundle.context(), secondBundle.context());
-        assertSame(shared, factory.create());
+        assertSame(secondBundle.context(), factory.create());
     }
 
     /** Concurrent first calls initialize once; obtaining the context and accepted snapshot never reloads the store. */
@@ -114,21 +121,52 @@ public class SslContextMetadataTest extends GridCommonAbstractTest {
         assertEquals(1, factory.loads);
     }
 
-    /** A failed reload leaves both the accepted snapshot and the forwarding context usable, and can be retried. */
+    /** Readers retain the accepted material while initialization fails; a later attempt can replace it. */
     @Test
     public void testFailedInitRetainsAcceptedBundle() throws Exception {
-        InMemoryStoreFactory factory = new InMemoryStoreFactory(ca.keyStoreWithPrivateKey());
+        InMemoryStoreFactory factory = spy(new InMemoryStoreFactory(ca.keyStoreWithPrivateKey()));
         SslBundle accepted = factory.init();
-        SSLContext shared = factory.create();
+        CountDownLatch loading = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        long timeout = 10_000;
 
         factory.loadFailure = "Key store is unavailable";
 
-        Throwable err = GridTestUtils.assertThrows(log, factory::init, IgniteException.class, factory.loadFailure);
+        doAnswer(inv -> {
+            loading.countDown();
+            release.await();
 
-        assertTrue(err.getCause() instanceof SSLException);
+            return inv.callRealMethod();
+        }).doCallRealMethod().when(factory).createSslBundle();
+
+        IgniteInternalFuture<SslBundle> initialization = GridTestUtils.runAsync(() -> {
+            return factory.init();
+        });
+        IgniteInternalFuture<SslBundle> reading = null;
+
+        try {
+            assertTrue(loading.await(timeout, TimeUnit.MILLISECONDS));
+
+            reading = GridTestUtils.runAsync(() -> {
+                assertSame(accepted.context(), factory.create());
+
+                return factory.sslBundle();
+            });
+
+            assertSame(accepted, reading.get(timeout));
+        }
+        finally {
+            release.countDown();
+
+            if (reading != null)
+                reading.cancel();
+
+            GridTestUtils.assertThrowsWithCause(() -> initialization.get(timeout), SSLException.class);
+        }
+
         assertSame(accepted, factory.sslBundle());
-        assertSame(shared, factory.create());
-        assertNotNull(shared.createSSLEngine());
+        assertSame(accepted.context(), factory.create());
+        assertNotNull(accepted.context().createSSLEngine());
         assertEquals(2, factory.loads);
 
         factory.loadFailure = null;
@@ -137,7 +175,7 @@ public class SslContextMetadataTest extends GridCommonAbstractTest {
 
         assertNotSame(accepted, replacement);
         assertSame(replacement, factory.sslBundle());
-        assertSame(shared, factory.create());
+        assertSame(replacement.context(), factory.create());
         assertEquals(3, factory.loads);
     }
 
@@ -201,7 +239,7 @@ public class SslContextMetadataTest extends GridCommonAbstractTest {
         assertEquals(0, factory.loads);
     }
 
-    /** Metadata includes only nonempty X.509 chains of key entries, without recovering the keys. */
+    /** Metadata includes only nonempty X.509 chains of key entries. */
     @Test
     public void testOnlyKeyEntriesWithX509Chains() throws Exception {
         String firstAlias = "first-key";
@@ -217,11 +255,12 @@ public class SslContextMetadataTest extends GridCommonAbstractTest {
         store.setEntry(secondAlias, second.getEntry(secondAlias, prot), prot);
         store.setCertificateEntry("trusted", first.getCertificate(firstAlias));
         store.setEntry("secret", new KeyStore.SecretKeyEntry(KeyGenerator.getInstance("AES").generateKey()),
-            new KeyStore.PasswordProtection("unrelated-password".toCharArray()));
+            prot);
         store.setKeyEntry("non-x509-chain", first.getKey(firstAlias, PWD), PWD,
             new Certificate[] {first.getCertificate(firstAlias), mock(Certificate.class)});
 
-        KeyMaterial material = new KeyMaterial(store, PWD, SslContextFactory.DFLT_KEY_ALGORITHM);
+        // PKIX defers key selection, allowing metadata filtering to inspect the entire mixed certificate chain.
+        KeyMaterial material = new KeyMaterial(store, PWD, "PKIX");
 
         assertEquals(Map.of(firstAlias, chain(first), secondAlias, chain(second)), material.certificateChains());
     }
@@ -238,17 +277,22 @@ public class SslContextMetadataTest extends GridCommonAbstractTest {
         assertEquals(Map.of(), bundle.certificateChains());
     }
 
-    /** Material keeps its own copy of the key password, so clearing the caller's array does not lock the keys. */
+    /** Initialized managers remain usable after clearing the password or changing a returned manager array. */
     @Test
-    public void testLoadedMaterialCopiesKeyPassword() throws Exception {
+    public void testLoadedMaterialKeepsInitializedKeyManagers() throws Exception {
+        String alias = "node";
         char[] pwd = PWD.clone();
-        KeyMaterial material = new KeyMaterial(ca.keyStoreWithPrivateKey("node"), pwd, SslContextFactory.DFLT_KEY_ALGORITHM);
+        KeyMaterial material = new KeyMaterial(ca.keyStoreWithPrivateKey(alias), pwd, SslContextFactory.DFLT_KEY_ALGORITHM);
 
         Arrays.fill(pwd, '?');
 
-        X509KeyManager mgr = (X509KeyManager)material.keyManagers()[0];
+        KeyManager[] mgrs = material.keyManagers();
+        X509KeyManager mgr = (X509KeyManager)mgrs[0];
 
-        assertNotNull(mgr.getPrivateKey("node"));
+        mgrs[0] = null;
+
+        assertNotNull(mgr.getPrivateKey(alias));
+        assertSame(mgr, material.keyManagers()[0]);
     }
 
     /** A bundle orders aliases and copies the map and its lists, so later changes to the input do not reach it. */
