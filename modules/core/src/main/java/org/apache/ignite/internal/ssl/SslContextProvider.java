@@ -42,7 +42,7 @@ public class SslContextProvider {
     /** Factory that owns the context, adapting a plain factory when necessary. */
     private final AbstractSslContextFactory sslFactory;
 
-    /** Stable context that forwards new engines and socket factories to the factory's accepted material. */
+    /** Shared context that forwards new engines and socket factories to the factory's accepted material. */
     private final SSLContext sharedCtx;
 
     /** */
@@ -72,7 +72,7 @@ public class SslContextProvider {
         return NODE_ACCESS.current(sslFactory);
     }
 
-    /** @return Stable context shared by every transport configured with this factory. */
+    /** @return Context shared by every transport configured with this factory. */
     SSLContext sharedContext() {
         return sharedCtx;
     }
@@ -82,7 +82,7 @@ public class SslContextProvider {
         transports.add(transport);
     }
 
-    /** @return Comma-separated transport names used in command output and node logs. */
+    /** @return Transport names in alphabetical order, separated by commas. */
     public String transports() {
         return String.join(", ", transports);
     }
@@ -100,7 +100,7 @@ public class SslContextProvider {
         NODE_ACCESS.startRenewal(sslFactory, exec, log, this::transports);
     }
 
-    /** @return Time of the next automatic renewal, {@code 0} if none is planned. */
+    /** @return Time of the next automatic renewal, or {@code 0} if none is planned or the node has stopped. */
     public long nextRenewalTime() {
         return NODE_ACCESS.nextRenewalTime(sslFactory);
     }

@@ -64,7 +64,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     public static final double DFLT_RENEW_BEFORE_FRACTION = 0.15;
 
     /**
-     * Gives the node access to the accepted material and the same reload path used by subclasses.
+     * Gives the node access to the accepted material, reload and automatic renewal.
      * @hidden
      */
     public static final SslFactoryAccess NODE_ACCESS = new SslFactoryAccess() {
@@ -195,14 +195,18 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         this.protocols = protocols;
     }
 
-    /** @return Whether a node builds its SSL context again before the certificate expires, to pick up a new certificate. */
+    /**
+     * A node reads this setting at startup, including when a subclass overrides it.
+     *
+     * @return Whether the node automatically loads replacement certificates before expiry.
+     */
     public boolean isRenewalEnabled() {
         return renewalEnabled;
     }
 
     /**
      * Sets whether a node calls {@link #createSslBundle()} before the certificates expire to pick up replacements.
-     * A file-based factory rereads its files. It does not replace them.
+     * A file-based factory rereads its files. Supply replacement certificates in those files.
      * When enabled, the factory must report at least one X.509 certificate chain, or the node does not start.
      * With renewal enabled, use a separate factory instance for each running node. Disabled by default.
      * Set this before starting the node; changing it on a running node takes effect after a restart.
@@ -213,7 +217,11 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         this.renewalEnabled = renewalEnabled;
     }
 
-    /** @return Share of the certificate lifetime left when a node starts to renew the certificate. */
+    /**
+     * A node with renewal enabled reads this setting at startup, including when a subclass overrides it.
+     *
+     * @return Share of the certificate lifetime left when renewal starts, strictly between zero and one.
+     */
     public double getRenewBeforeFraction() {
         return renewBeforeFraction;
     }
@@ -241,7 +249,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
 
     /**
      * Loads a fresh context and matching certificate metadata from this factory's source. Check source parameters before
-     * loading it. Keep the material in use intact. Calling {@link #create()} from this hook would recurse on first use.
+     * loading it. Preserve the accepted key managers. Calling {@link #create()} from this hook would recurse on first use.
      *
      * @return Fresh context and the certificate metadata available to this factory.
      * @throws SSLException If the context could not be created.
@@ -400,15 +408,15 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     protected abstract TrustManager[] createTrustManagers() throws SSLException;
 
     /**
-     * Loads and validates fresh material before replacing the accepted context and its metadata. Calls run one at a time.
-     * A failed initialization leaves the previous material in use.
+     * Loads fresh material and checks that the configured protocols and cipher suites can be applied before publishing
+     * the context and its metadata. Calls run one at a time. A failed initialization leaves the previous material in use.
      *
      * <p>
-     * The first initialization permits material without certificate chains and certificates outside their validity period,
-     * matching node startup. Later calls reject a context already in use, known empty certificate metadata and chains with
-     * any expired or not-yet-valid certificate. Peers must trust the replacement; this method does not test connections.
-     * While automatic renewal is attached, replacement metadata must contain at least one chain. Every successful replacement
-     * replans renewal. The failure count clears only when the earliest chain expiry advances.
+     * The first load, including a retry after failure, can accept no certificate chains or certificates outside their
+     * validity period. After a successful load, calls reject the context already in use, an empty chain map, or an expired
+     * or not-yet-valid certificate in any chain. Check peer trust with a new connection.
+     * While a running node automatically renews this factory, a replacement must report at least one certificate chain.
+     * Each successful replacement schedules the next renewal.
      *
      * @return Context and metadata accepted by this initialization.
      * @throws IgniteException If the material cannot be loaded, the context cannot be created or a replacement is rejected.
@@ -447,7 +455,8 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * @param exec Renewal executor owned and stopped by the node.
      * @param log Renewal logger.
      * @param transports Names of the transports currently using this factory, evaluated when logging.
-     * @throws IgniteException If another running node owns renewal, the renewal window is invalid or certificate metadata is unavailable.
+     * @throws IgniteException If another running node uses this factory and either node enables renewal, or if renewal is
+     *      enabled and the window is invalid, initialization fails or the factory reports no X.509 chain.
      */
     private synchronized void startRenewal(ScheduledExecutorService exec, IgniteLogger log, Supplier<String> transports) {
         boolean enabled = isRenewalEnabled();
@@ -645,6 +654,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * @return Accepted bundle.
      * @throws IgniteException If the first initialization fails to load the material or create the context.
      * @throws IllegalArgumentException If the JVM does not recognize a configured protocol or cipher suite name.
+     * @throws UnsupportedOperationException If the context does not support stream sockets.
      */
     final SslBundle sslBundle() {
         SslBundle cur = bundle;
@@ -669,6 +679,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * @return Currently accepted context.
      * @throws IgniteException If the first initialization fails to load the material or create the context.
      * @throws IllegalArgumentException If the JVM does not recognize a configured protocol or cipher suite name.
+     * @throws UnsupportedOperationException If the context does not support stream sockets.
      */
     @Override public final SSLContext create() {
         return sslBundle().context();
