@@ -33,7 +33,7 @@ import org.apache.ignite.internal.util.typedef.internal.U;
 
 import static org.apache.ignite.internal.thread.pool.IgniteScheduledThreadPoolExecutor.newSingleThreadScheduledExecutor;
 
-/** SSL contexts of a node: one provider per configured factory, with automatic renewals and their node-wide failure metric. */
+/** Node SSL context providers shared by transports using the same factory, with automatic renewal and a node-wide failure metric. */
 public class SslContextRegistry extends GridProcessorAdapter {
     /** */
     public static final String COMMUNICATION = "communication";
@@ -75,9 +75,8 @@ public class SslContextRegistry extends GridProcessorAdapter {
 
     /**
      * @param factory Factory the transport is configured with.
-     * @param transport Transport, one of the names above.
-     * @return Context that delegates to the factory's current context. Transports configured with the same factory object share it,
-     *      so reload updates the context for all of them.
+     * @param transport Transport name from the constants of this class.
+     * @return Context shared by the transports using this factory. New connections use its current material.
      */
     public synchronized SSLContext register(Factory<SSLContext> factory, String transport) {
         SslContextProvider provider = providers.stream().filter(p -> p.factory() == factory).findFirst().orElse(null);
