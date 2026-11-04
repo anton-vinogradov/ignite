@@ -527,8 +527,9 @@ public class ConnectorConfiguration {
 
     /**
      * Sets the certificate source for HTTPS on the HTTP REST port. The node includes these certificates in
-     * {@code control.sh --ssl reload} and {@code --ssl status}. Jetty applies its default protocol and cipher exclusions
-     * to the factory's settings. To require client certificates, set {@link #setHttpSslClientAuth(boolean)}.
+     * {@code control.sh --ssl reload} and {@code --ssl status}, and renews them automatically when renewal is enabled.
+     * Jetty applies its default protocol and cipher exclusions to the factory's settings. To require client certificates,
+     * set {@link #setHttpSslClientAuth(boolean)}.
      * <p>
      * The built-in connector and a connector configured through {@link #setJettyPath(String)} must have HTTP as their default
      * protocol and leave TLS to this factory. An explicit {@code SecureRequestCustomizer} retains its Host checks.
