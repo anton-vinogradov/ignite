@@ -86,7 +86,7 @@ The following table describes the properties of `ConnectorConfiguration` that ar
 |`null`
 
 |`setHttpSslFactory(Factory<SSLContext>)`
-|SSL context factory for HTTPS on the HTTP REST port. Supports certificate reload. See <<HTTPS and Certificate Reload>>.
+|SSL context factory for HTTPS on the HTTP REST port. Supports certificate reload and automatic renewal. See <<HTTPS and Certificate Reload>>.
 |Yes
 |`null`
 
@@ -112,7 +112,7 @@ To require a client certificate trusted by this factory, also enable `httpSslCli
 cfg.setConnectorConfiguration(new ConnectorConfiguration().setHttpSslFactory(restTls).setHttpSslClientAuth(true));
 ----
 
-After replacing the certificates in the factory's source, run link:tools/control-script#reloading-certificates[`control.sh --ssl reload`]. Check the certificates listed under `HTTP REST` with link:tools/control-script#checking-certificates[`control.sh --ssl status`].
+After updating the certificates in the factory's source, run link:tools/control-script#reloading-certificates[`control.sh --ssl reload`] to load them immediately. With link:security/ssl-tls#renewing-certificates-automatically[automatic renewal] enabled at startup, Ignite also loads them when renewal is due. Check the certificates listed under `HTTP REST` with link:tools/control-script#checking-certificates[`control.sh --ssl status`].
 Transports sharing the same factory object appear together and reload in one step. The `sslEnabled` and `sslFactory` properties configure binary REST independently.
 By default HTTP REST accepts a `Host` header even when the name or address is absent from the certificate. To require a match, set `jettyPath` to a Jetty XML file whose `HttpConfiguration` includes a `SecureRequestCustomizer` with `sniHostCheck=true`.
 
