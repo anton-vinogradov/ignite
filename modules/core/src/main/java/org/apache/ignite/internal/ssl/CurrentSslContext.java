@@ -84,9 +84,12 @@ class CurrentSslContext extends SSLContext {
             return ctx.get().getClientSessionContext();
         }
 
-        /** {@inheritDoc} */
+        /**
+         * Returns the effective TLS parameters of a new engine. A factory can restrict its engines' protocols and cipher suites
+         * while its underlying context still reports JVM defaults.
+         */
         @Override protected SSLParameters engineGetDefaultSSLParameters() {
-            return ctx.get().getDefaultSSLParameters();
+            return ctx.get().createSSLEngine().getSSLParameters();
         }
 
         /** {@inheritDoc} */
