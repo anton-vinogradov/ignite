@@ -26,14 +26,19 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSocket;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.configuration.ConnectorConfiguration;
 import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.internal.processors.rest.GridRestProtocol;
+import org.apache.ignite.internal.ssl.SslContextProvider;
 import org.apache.ignite.internal.util.typedef.internal.U;
+import org.apache.ignite.ssl.SslBundle;
 import org.apache.ignite.ssl.SslContextFactory;
 import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.TestCertificateAuthority;
@@ -44,6 +49,8 @@ import org.eclipse.jetty.server.SslConnectionFactory;
 import org.junit.Test;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.util.concurrent.TimeUnit.HOURS;
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static org.apache.ignite.internal.IgniteNodeAttributes.ATTR_REST_JETTY_PORT;
 import static org.apache.ignite.internal.ssl.SslContextRegistry.HTTP_REST;
 import static org.apache.ignite.ssl.SslTestUtils.assertClientAuthentication;
@@ -53,13 +60,14 @@ import static org.apache.ignite.ssl.SslTestUtils.reload;
 import static org.apache.ignite.ssl.SslTestUtils.servedCertificate;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 import static org.apache.ignite.testframework.GridTestUtils.assertThrowsAnyCause;
+import static org.apache.ignite.testframework.GridTestUtils.waitForCondition;
 import static org.apache.ignite.testframework.TestCertificateAuthority.PWD;
 import static org.apache.ignite.testframework.TestCertificateAuthority.chain;
 import static org.apache.ignite.testframework.TestCertificateAuthority.save;
 import static org.junit.Assert.assertArrayEquals;
 
 /**
- * HTTPS of HTTP REST set up with {@link ConnectorConfiguration#setHttpSslFactory}: reload, client authentication, TLS parameters,
+ * HTTPS of HTTP REST set up with {@link ConnectorConfiguration#setHttpSslFactory}: reload, renewal, client authentication, TLS parameters,
  * Jetty XML connectors and refused configurations. HTTP REST starts on old-key from old-ca and trusts both authorities unless a test
  * says otherwise; probes trust both authorities and present no client certificate unless a test needs one.
  */
@@ -144,6 +152,62 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
         }
 
         assertEquals(chain(newKeys).get(0), servedCertificate(client, port(g)));
+    }
+
+    /** Automatic renewal on an HTTP-only factory changes the full chain served on new HTTPS connections. */
+    @Test
+    public void testHttpsGetsAutomaticallyRenewedChain() throws Exception {
+        prepareStores();
+
+        long now = System.currentTimeMillis();
+        long hour = HOURS.toMillis(1);
+        String renewedAlias = "renewed";
+        KeyStore replacement = newCa.keyStoreWithPrivateKey(renewedAlias, now, now + hour);
+        CountDownLatch fileReplaced = new CountDownLatch(1);
+        AtomicBoolean startup = new AtomicBoolean(true);
+        SslContextFactory factory = factory(new SslContextFactory() {
+            /** {@inheritDoc} */
+            @Override protected SslBundle createSslBundle() throws SSLException {
+                if (!startup.getAndSet(false)) {
+                    try {
+                        fileReplaced.await();
+                    }
+                    catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+
+                        throw new SSLException(e);
+                    }
+                }
+
+                return super.createSslBundle();
+            }
+        });
+
+        // The startup key is already inside its renewal window.
+        factory.setRenewBeforeFraction(0.5);
+        factory.setRenewalEnabled(true);
+        save(oldCa.keyStoreWithPrivateKey(OLD_KEY, now - hour, now + MINUTES.toMillis(10)), keyFile);
+
+        IgniteEx g;
+
+        try {
+            g = startNode(new ConnectorConfiguration().setHttpSslFactory(factory));
+
+            save(replacement, keyFile);
+        }
+        finally {
+            fileReplaced.countDown();
+        }
+
+        SslContextProvider provider = g.context().sslContexts().providers().iterator().next();
+
+        assertTrue(waitForCondition(() -> provider.certificateChains().containsKey(renewedAlias), 10_000));
+
+        try (SSLSocket sock = socket(clientContext(null, trustBoth), port(g))) {
+            sock.startHandshake();
+
+            assertArrayEquals(chain(replacement).toArray(), sock.getSession().getPeerCertificates());
+        }
     }
 
     /** With client authentication, HTTP REST accepts a client of the authority it trusts now and refuses one it trusted before reload. */
@@ -251,7 +315,11 @@ public class JettySslContextReloadTest extends GridCommonAbstractTest {
 
     /** @return Factory reading {@link #keyFile} and {@link #trustFile}. */
     private SslContextFactory factory() {
-        SslContextFactory factory = new SslContextFactory();
+        return factory(new SslContextFactory());
+    }
+
+    /** Configures the factory to read the HTTP test's key and trust files. */
+    private SslContextFactory factory(SslContextFactory factory) {
 
         factory.setKeyStoreType("JKS");
         factory.setKeyStoreFilePath(keyFile.toString());

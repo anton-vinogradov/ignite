@@ -292,7 +292,11 @@ Configure the factory used by each connection type:
 |The node's factory, or `ClientConnectorConfiguration.sslContextFactory` with `useIgniteSslContextFactory=false`
 |Binary REST
 |The node's factory, or `ConnectorConfiguration.sslFactory`
+|HTTP REST
+|`ConnectorConfiguration.httpSslFactory`
 |===
+
+Ignite can renew HTTPS certificates only when the HTTP connector uses `httpSslFactory`.
 
 Connection types on one node that share a factory renew together. Use a separate factory instance for each node with renewal enabled.
 
