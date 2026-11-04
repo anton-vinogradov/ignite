@@ -188,9 +188,14 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * @param renewBeforeFraction Share of the lifetime.
      */
     public void setRenewBeforeFraction(double renewBeforeFraction) {
-        A.ensure(renewBeforeFraction > 0 && renewBeforeFraction < 1, "renewBeforeFraction must be greater than 0 and less than 1");
+        A.ensure(validRenewBeforeFraction(renewBeforeFraction), "renewBeforeFraction must be greater than 0 and less than 1");
 
         this.renewBeforeFraction = renewBeforeFraction;
+    }
+
+    /** @return Whether the renewal window starts within the certificate lifetime. */
+    private static boolean validRenewBeforeFraction(double fraction) {
+        return fraction > 0 && fraction < 1;
     }
 
     /**
@@ -239,10 +244,16 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         return new SslBundle(createSslContext(keyMgrs), chains);
     }
 
-    /** @return Fresh candidate with factory context added to checked SSL errors. */
+    /** @return Fresh candidate that can create engines and supply sockets for TCP discovery. */
     private SslBundle prepareSslBundle() {
         try {
-            return createSslBundle();
+            SslBundle next = createSslBundle();
+            SSLContext ctx = next.context();
+
+            ctx.createSSLEngine();
+            ctx.getSocketFactory();
+
+            return next;
         }
         catch (SSLException e) {
             throw new IgniteException(e.getMessage() + " [factory=" + this + ']', e);
@@ -362,21 +373,15 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * @return Context and metadata accepted by this initialization.
      * @throws IgniteException If the material cannot be loaded, the context cannot be created or a replacement is rejected.
      * @throws IllegalArgumentException If a configured protocol or cipher suite is unsupported.
+     * @throws UnsupportedOperationException If the context does not support stream sockets.
      */
     public final synchronized SslBundle init() {
         try {
-            SslBundle next;
             boolean reload = bundle != null;
+            SslBundle next = reload ? buildReplacement() : prepareSslBundle();
 
-            if (reload) {
-                next = buildReplacement();
-
+            if (reload)
                 checkReplacement(next, renewal != null);
-            }
-            else {
-                next = prepareSslBundle();
-                next.context().createSSLEngine();
-            }
 
             putInUse(next);
 
@@ -402,7 +407,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * @param exec Renewal executor owned and stopped by the node.
      * @param log Renewal logger.
      * @param transports Names of the transports currently using this factory, evaluated when logging.
-     * @throws IgniteException If renewal is already attached to another running node or certificate metadata is unavailable.
+     * @throws IgniteException If another running node owns renewal, the renewal window is invalid or certificate metadata is unavailable.
      */
     public final synchronized void startRenewal(ScheduledExecutorService exec, IgniteLogger log, Supplier<String> transports) {
         boolean enabled = isRenewalEnabled();
@@ -418,17 +423,26 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         renewal = null;
         renewalExec = null;
 
-        if (enabled && SslCertificates.renewalChain(sslBundle()) == null) {
-            throw new IgniteException("The SSL context factory must provide at least one X.509 certificate chain " +
-                "to renew automatically [transports=" + transports.get() + ']');
+        if (enabled) {
+            double fraction = getRenewBeforeFraction();
+
+            if (!validRenewBeforeFraction(fraction)) {
+                throw new IgniteException("renewBeforeFraction must be greater than 0 and less than 1 " +
+                    "[value=" + fraction + ']');
+            }
+
+            if (SslCertificates.renewalChain(sslBundle()) == null) {
+                throw new IgniteException("The SSL context factory must provide at least one X.509 certificate chain " +
+                    "to renew automatically [transports=" + transports.get() + ']');
+            }
+
+            renewal = new SslRenewal(this, fraction, exec, log, transports);
         }
 
         renewalExec = exec;
 
-        if (enabled) {
-            renewal = new SslRenewal(this, getRenewBeforeFraction(), exec, log, transports);
+        if (renewal != null)
             renewal.replan();
-        }
     }
 
     /**
@@ -449,7 +463,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         try {
             SslBundle next = buildReplacement();
 
-            if (Thread.currentThread().isInterrupted())
+            if (renewalInterrupted())
                 throw new IgniteInterruptedCheckedException("TLS certificate renewal was interrupted");
 
             Map<String, List<X509Certificate>> chains = next.certificateChains();
@@ -474,7 +488,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
             putInUse(next);
         }
         catch (Throwable e) {
-            if (!Thread.currentThread().isInterrupted() &&
+            if (!renewalInterrupted() &&
                 !X.hasCause(e, InterruptedException.class, IgniteInterruptedException.class, IgniteInterruptedCheckedException.class)) {
                 renewalFailures++;
 
@@ -487,6 +501,11 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
         onSuccess();
 
         return bundle;
+    }
+
+    /** @return Whether the renewal thread was interrupted or its node stopped the executor during the load. */
+    private boolean renewalInterrupted() {
+        return Thread.currentThread().isInterrupted() || (renewalExec != null && renewalExec.isShutdown());
     }
 
     /** @return Failed automatic attempts since the earliest expiry across all chains was advanced. */
@@ -510,8 +529,6 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
             throw new IgniteException("The new key material has no X.509 certificate chains, " +
                 "so the node would present no certificate");
         }
-
-        next.context().createSSLEngine();
 
         return next;
     }
