@@ -528,8 +528,9 @@ public class ConnectorConfiguration {
 
     /**
      * Sets the SSL context factory for HTTPS on the HTTP REST port. The node includes its certificates in
-     * {@code control.sh --ssl reload} and {@code --ssl status}. Jetty applies its default protocol and cipher exclusions
-     * to the factory's settings. To require client certificates, set {@link #setHttpSslClientAuth(boolean)}.
+     * {@code control.sh --ssl reload} and {@code --ssl status}, and renews them automatically when renewal is enabled.
+     * Jetty applies its default protocol and cipher exclusions to the factory's settings. To require client certificates,
+     * set {@link #setHttpSslClientAuth(boolean)}.
      * A {@link LifecycleAware} factory starts and stops once per node even when shared with binary REST.
      * <p>
      * With this factory, a node that runs HTTP REST fails to start if a connector from {@link #setJettyPath(String)}
