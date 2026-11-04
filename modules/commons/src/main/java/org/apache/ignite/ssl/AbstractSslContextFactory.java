@@ -218,9 +218,10 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
     }
 
     /**
-     * A node with renewal enabled reads this setting at startup.
+     * A node with renewal enabled reads this setting at startup and does not start unless its value is greater than
+     * {@code 0} and less than {@code 1}.
      *
-     * @return Share of the certificate lifetime left when renewal starts, strictly between zero and one.
+     * @return Share of the certificate lifetime left when renewal starts.
      */
     public double getRenewBeforeFraction() {
         return renewBeforeFraction;
@@ -249,7 +250,8 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
 
     /**
      * Loads a fresh context and matching certificate metadata from this factory's source. Check source parameters before
-     * loading it. Preserve the accepted key managers. Calling {@link #create()} from this hook would recurse on first use.
+     * loading it. Do not modify a key store or key managers that the accepted context uses. Calling {@link #create()}
+     * from this hook would recurse on first use.
      *
      * @return Fresh context and the certificate metadata available to this factory.
      * @throws SSLException If the context could not be created.
@@ -267,7 +269,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * @return Context and nonempty X.509 chains of key entries, ordered by alias. An empty map means no such chains were found.
      * @throws SSLException If the store cannot be read or the context cannot be created.
      */
-    protected final SslBundle createSslBundle(@Nullable KeyStore store, @Nullable char[] keyPwd, String algorithm)
+    protected final SslBundle createSslBundle(@Nullable KeyStore store, char @Nullable [] keyPwd, String algorithm)
         throws SSLException {
         A.notNull(algorithm, "algorithm");
 
@@ -412,7 +414,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
      * the context and its metadata. Calls run one at a time. A failed initialization leaves the previous material in use.
      *
      * <p>
-     * The first load, including a retry after failure, can accept no certificate chains or certificates outside their
+     * The first load, including a retry after failure, accepts material with no certificate chains or with certificates outside their
      * validity period. After a successful load, calls reject the context already in use, an empty chain map, or an expired
      * or not-yet-valid certificate in any chain. Check peer trust with a new connection.
      * While a running node automatically renews this factory, a replacement must report at least one certificate chain.
@@ -429,7 +431,7 @@ public abstract class AbstractSslContextFactory implements Factory<SSLContext> {
             SslBundle next = reload ? buildReplacement() : prepareSslBundle();
 
             if (reload)
-                checkReplacement(next, renewal != null && !renewalExec.isShutdown());
+                checkReplacement(next, renewal != null && !renewalStopped());
 
             putInUse(next);
 
