@@ -63,9 +63,12 @@ public class PartitionStateFromOwnerRollingUpgradeTest extends AbstractRollingUp
     private static final long WAIT = 30_000;
 
     /**
-     * Before the upgrade the coordinator and the client see the new owners right after the exchange, with the owners'
-     * maps held. Once all nodes are upgraded and the version is finalized, the feature is active, and they see the new
-     * owners only after the maps arrive.
+     * Given servers and a client of a version without {@code PART_STATE_FROM_OWNER_FEATURE}, a cache without backups
+     * under the IGNORE policy, and the maps that the servers send outside an exchange held.
+     * When a server leaves with the only copies of some partitions, then all nodes are upgraded, the version is
+     * finalized, and the server comes back and leaves again.
+     * Then after the first leave the coordinator and the client show the new owners right after the exchange, and after
+     * the second leave only after the owners' maps arrive.
      *
      * @throws Exception If failed.
      */

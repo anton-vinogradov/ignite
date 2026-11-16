@@ -25,6 +25,7 @@ import org.junit.Test;
 
 import static org.apache.ignite.cache.PartitionLossPolicy.IGNORE;
 import static org.apache.ignite.cache.PartitionLossPolicy.READ_WRITE_SAFE;
+import static org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtPartitionState.LOST;
 
 /**
  * Checks that the other nodes learn the state of a lost partition from its new owner. A server leaves with the only
@@ -54,6 +55,10 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     }
 
     /**
+     * Given three servers, a client and a cache without backups under the IGNORE policy.
+     * When a server leaves with the only copies of its partitions, and the other servers own them.
+     * Then the partition map of every node shows these partitions as OWNING on their new owners.
+     *
      * @throws Exception If failed.
      */
     @Test
@@ -62,6 +67,10 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     }
 
     /**
+     * Given three servers, a client and a cache without backups under the READ_WRITE_SAFE policy.
+     * When a server leaves with the only copies of its partitions, and the other servers mark them LOST.
+     * Then the partition map of every node shows these partitions as LOST on the servers that hold them.
+     *
      * @throws Exception If failed.
      */
     @Test
@@ -70,7 +79,10 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     }
 
     /**
-     * The coordinator is the only new owner, so only the client learns the state from another node.
+     * Given the coordinator, another server, a client and a cache without backups under the IGNORE policy.
+     * When the other server leaves, and the coordinator owns all its partitions.
+     * Then the partition map of every node shows these partitions as OWNING on the coordinator. Only the client learns
+     * this state from another node.
      *
      * @throws Exception If failed.
      */
@@ -80,7 +92,29 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     }
 
     /**
-     * Starts the servers and a client, then stops the last server.
+     * Given three servers, a client and a cache without backups under the READ_WRITE_SAFE policy, and a server that
+     * left with the only copies of its partitions.
+     * When the server comes back and gets its lost partitions as LOST.
+     * Then the partition map of every node shows these partitions as LOST on the returned server.
+     *
+     * @throws Exception If failed.
+     */
+    @Test
+    public void testServerReturnsWhileLost() throws Exception {
+        checkServerLeft(READ_WRITE_SAFE, 3);
+
+        startGrid(2);
+
+        assertTrue("The returned server holds no lost partitions",
+            grid(2).cachex(CACHE).context().topology().localPartitions().stream().anyMatch(p -> p.state() == LOST));
+
+        awaitPartitionMapsMatchLocalStates(CACHE);
+    }
+
+    /**
+     * Gives a cluster where the last server has left with the only copies of its partitions, and the partition map of
+     * every node matches the servers' local states. Starts the servers and a client, waits until the partitions that
+     * moved while the servers joined are evicted, then stops the last server.
      *
      * @param plc Partition loss policy.
      * @param srvs Number of servers.

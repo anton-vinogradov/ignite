@@ -860,10 +860,10 @@ public abstract class GridCommonAbstractTest extends GridAbstractTest {
      * Waits until every node finishes the exchange on the topology version it knows. Then waits until the partition map
      * of every node shows the partitions of each server in the states that the server holds locally.
      *
-     * @param cacheNames Cache names.
+     * @param cacheName Cache name.
      * @throws Exception If failed.
      */
-    protected void awaitPartitionMapsMatchLocalStates(String... cacheNames) throws Exception {
+    protected void awaitPartitionMapsMatchLocalStates(String cacheName) throws Exception {
         long timeout = getPartitionMapExchangeTimeout();
 
         for (Ignite g : G.allGrids()) {
@@ -873,14 +873,12 @@ public abstract class GridCommonAbstractTest extends GridAbstractTest {
                 .affinityReadyFuture(node.context().discovery().topologyVersionEx()).get(timeout);
         }
 
-        for (String cacheName : cacheNames) {
-            for (Ignite g : G.allGrids()) {
-                IgniteEx viewer = (IgniteEx)g;
+        for (Ignite g : G.allGrids()) {
+            IgniteEx viewer = (IgniteEx)g;
 
-                if (!waitForCondition(() -> partitionMapMismatches(viewer, cacheName).isEmpty(), timeout)) {
-                    fail("The partition map of " + viewer.name() + " differs from the local partition states: " +
-                        partitionMapMismatches(viewer, cacheName));
-                }
+            if (!waitForCondition(() -> partitionMapMismatches(viewer, cacheName).isEmpty(), timeout)) {
+                fail("The partition map of " + viewer.name() + " differs from the local partition states: " +
+                    partitionMapMismatches(viewer, cacheName));
             }
         }
     }

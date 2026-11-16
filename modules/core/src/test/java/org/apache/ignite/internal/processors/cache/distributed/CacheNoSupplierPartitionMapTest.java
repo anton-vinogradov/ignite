@@ -86,7 +86,10 @@ public class CacheNoSupplierPartitionMapTest extends GridCommonAbstractTest {
     }
 
     /**
-     * The first data node gets all partitions when it joins the baseline and owns them, since no node has them.
+     * Given the coordinator, another server and a client without the cache's data, and a data node outside the baseline
+     * whose system cache rebalance is held.
+     * When the data node joins the baseline and owns all the cache's partitions, since no node has them.
+     * Then the partition map of every node shows these partitions as OWNING on the data node.
      *
      * @throws Exception If failed.
      */
