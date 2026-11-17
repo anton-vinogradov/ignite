@@ -79,19 +79,6 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     }
 
     /**
-     * Given the coordinator, another server, a client and a cache without backups under the IGNORE policy.
-     * When the other server leaves, and the coordinator owns all its partitions.
-     * Then the partition map of every node shows these partitions as OWNING on the coordinator. Only the client learns
-     * this state from another node.
-     *
-     * @throws Exception If failed.
-     */
-    @Test
-    public void testLostPartitionOwnedByCoordinator() throws Exception {
-        checkServerLeft(IGNORE, 2);
-    }
-
-    /**
      * Given three servers, a client and a cache without backups under the READ_WRITE_SAFE policy, and a server that
      * left with the only copies of its partitions.
      * When the server comes back and gets its lost partitions as LOST.
@@ -109,6 +96,19 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
             grid(2).cachex(CACHE).context().topology().localPartitions().stream().anyMatch(p -> p.state() == LOST));
 
         awaitPartitionMapsMatchLocalStates(CACHE);
+    }
+
+    /**
+     * Given the coordinator, another server, a client and a cache without backups under the IGNORE policy.
+     * When the other server leaves, and the coordinator owns all its partitions.
+     * Then the partition map of every node shows these partitions as OWNING on the coordinator. Only the client learns
+     * this state from another node.
+     *
+     * @throws Exception If failed.
+     */
+    @Test
+    public void testLostPartitionOwnedByCoordinator() throws Exception {
+        checkServerLeft(IGNORE, 2);
     }
 
     /**
