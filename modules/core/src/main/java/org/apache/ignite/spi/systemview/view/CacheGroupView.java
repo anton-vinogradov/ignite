@@ -76,13 +76,13 @@ public class CacheGroupView {
     }
 
     /** @return Cache mode. */
-    @Order(3)
+    @Order(4)
     public CacheMode cacheMode() {
         return ccfg.getCacheMode();
     }
 
     /** @return Atomicity mode. */
-    @Order(4)
+    @Order(3)
     public CacheAtomicityMode atomicityMode() {
         return ccfg.getAtomicityMode();
     }
