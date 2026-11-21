@@ -66,11 +66,6 @@ public class CacheListCommandArg extends IgniteDataTransferObject {
     boolean seq;
 
     /** */
-    @Order(6)
-    @Argument(description = "print only persistent caches", optional = true)
-    boolean persistent;
-
-    /** */
     public String regex() {
         return regex;
     }
