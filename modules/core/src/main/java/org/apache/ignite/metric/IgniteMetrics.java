@@ -39,6 +39,11 @@ import org.apache.ignite.spi.metric.ReadOnlyMetricRegistry;
  */
 @IgniteExperimental
 public interface IgniteMetrics extends Iterable<ReadOnlyMetricRegistry> {
+    /** @return Number of custom registries. */
+    default int registryCount() {
+        return 0;
+    }
+
     /**
      * Gets or creates custom metric registry.
      *

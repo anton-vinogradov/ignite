@@ -116,13 +116,6 @@ import org.jetbrains.annotations.Nullable;
  */
 public interface IgniteDataStreamer<K, V> extends AutoCloseable {
     /**
-     * Default max concurrent put operations count.
-     * @deprecated Is not used anymore.
-     */
-    @Deprecated
-    public static final int DFLT_MAX_PARALLEL_OPS = 16;
-
-    /**
      * Default multiplier for data streamer pool size to get concurrent batches count for each remote node.
      *
      * @see IgniteConfiguration#getDataStreamerThreadPoolSize()
