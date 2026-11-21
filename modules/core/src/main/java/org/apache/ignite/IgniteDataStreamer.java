@@ -133,6 +133,9 @@ public interface IgniteDataStreamer<K, V> extends AutoCloseable {
     /** Default operations batch size to sent to remote node for loading. */
     public static final int DFLT_PER_NODE_BUFFER_SIZE = 512;
 
+    /** */
+    public static final int BROKEN = ;
+
     /** Default batch size per thread to send to buffer on node. */
     public static final int DFLT_PER_THREAD_BUFFER_SIZE = 4096;
 
