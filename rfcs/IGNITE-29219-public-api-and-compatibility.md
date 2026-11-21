@@ -75,3 +75,5 @@ Document supported client/server version combinations, data upgrade paths, and J
 - **Node-to-node protocols:** internal communication and discovery protocols.
 - **Diagnostics:** stack traces and log wording that the interface does not guarantee.
 - **Timing:** execution timing that the interface does not guarantee.
+
+Test line for the public behavior check.
