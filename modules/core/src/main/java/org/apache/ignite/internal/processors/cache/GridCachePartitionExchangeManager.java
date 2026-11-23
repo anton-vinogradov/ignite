@@ -1188,6 +1188,20 @@ public class GridCachePartitionExchangeManager<K, V> extends GridCacheSharedMana
      * @param grps Cache groups for partitions refresh.
      */
     public void refreshPartitions(@NotNull Collection<CacheGroupContext> grps) {
+        refreshPartitions(grps, null);
+    }
+
+    /**
+     * Refreshes the partition maps for the selected cache groups.
+     *
+     * @param grps Cache groups to refresh.
+     * @param rmtTopVer Version the coordinator uses to select recipients and tag the full message.
+     *     Pass the result version when completing an exchange, or {@code null} to use the last initialized exchange.
+     */
+    public void refreshPartitions(
+        @NotNull Collection<CacheGroupContext> grps,
+        @Nullable AffinityTopologyVersion rmtTopVer
+    ) {
         if (grps.isEmpty()) {
             if (log.isDebugEnabled())
                 log.debug("Skip partitions refresh, there are no cache groups for partition refresh.");
@@ -1219,13 +1233,14 @@ public class GridCachePartitionExchangeManager<K, V> extends GridCacheSharedMana
                     cctx.affinity().checkRebalanceState(top, grp.groupId());
             }
 
-            GridDhtPartitionsExchangeFuture lastFut = lastInitializedFut;
+            if (rmtTopVer == null) {
+                GridDhtPartitionsExchangeFuture lastFut = lastInitializedFut;
 
-            // No need to send to nodes which did not finish their first exchange.
-            AffinityTopologyVersion rmtTopVer =
-                lastFut != null ?
-                    (lastFut.isDone() && lastFut.error() == null ? lastFut.topologyVersion() : lastFut.initialVersion())
+                // No need to send to nodes which did not finish their first exchange.
+                rmtTopVer = lastFut != null
+                    ? (lastFut.isDone() && lastFut.error() == null ? lastFut.topologyVersion() : lastFut.initialVersion())
                     : AffinityTopologyVersion.NONE;
+            }
 
             Collection<ClusterNode> rmts = cctx.discovery().remoteAliveNodesWithCaches(rmtTopVer);
 
