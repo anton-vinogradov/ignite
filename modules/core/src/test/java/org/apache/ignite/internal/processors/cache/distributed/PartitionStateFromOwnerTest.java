@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import org.apache.ignite.cache.PartitionLossPolicy;
+import org.apache.ignite.cluster.ClusterNode;
 import org.apache.ignite.configuration.CacheConfiguration;
 import org.apache.ignite.configuration.IgniteConfiguration;
 import org.apache.ignite.events.DiscoveryEvent;
@@ -143,11 +144,12 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
         before.topologyVersion(exch.readyAffinityVersion());
 
         TestRecordingCommunicationSpi spi = TestRecordingCommunicationSpi.spi(crd);
+        ClusterNode observer = noData.localNode();
 
         spi.blockMessages(GridDhtPartitionsFullMessage.class, noData.name());
 
         spi.record((node, msg) -> {
-            if (!node.equals(noData.localNode()) || !(msg instanceof GridDhtPartitionsFullMessage))
+            if (!node.equals(observer) || !(msg instanceof GridDhtPartitionsFullMessage))
                 return false;
 
             GridDhtPartitionsFullMessage full = (GridDhtPartitionsFullMessage)msg;
