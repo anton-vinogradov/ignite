@@ -365,9 +365,9 @@ public class GridDhtPartitionsExchangeFuture extends GridDhtTopologyFutureAdapte
     /** Register caches future. Initialized on exchange init. Must be waited on exchange end. */
     private IgniteInternalFuture<?> registerCachesFuture;
 
-    /** Latest (by update sequences) full message with exchangeId == null, need to be processed right after future is done. */
+    /** Full updates in arrival order. The client topology checks the version of each refresh after the exchange. */
     @GridToStringExclude
-    private GridDhtPartitionsFullMessage delayedLatestMsg;
+    private List<T2<ClusterNode, GridDhtPartitionsFullMessage>> delayedFullMsgs;
 
     /** Time bag to measure and store exchange stages times. */
     @GridToStringExclude
@@ -5218,29 +5218,33 @@ public class GridDhtPartitionsExchangeFuture extends GridDhtTopologyFutureAdapte
         if (isDone())
             return false;
 
-        GridDhtPartitionsFullMessage prev = delayedLatestMsg;
-
-        if (prev == null) {
-            delayedLatestMsg = fullMsg;
+        if (delayedFullMsgs == null) {
+            delayedFullMsgs = new ArrayList<>();
+            delayedFullMsgs.add(new T2<>(node, fullMsg));
 
             listen(f -> {
-                if (f.error() != null)
-                    return;
-
-                GridDhtPartitionsFullMessage msg;
+                List<T2<ClusterNode, GridDhtPartitionsFullMessage>> msgs;
 
                 synchronized (this) {
-                    msg = delayedLatestMsg;
+                    msgs = delayedFullMsgs;
 
-                    delayedLatestMsg = null;
+                    delayedFullMsgs = null;
                 }
 
-                if (msg != null)
-                    cctx.exchange().processFullPartitionUpdate(node, msg);
+                if (f.error() == null) {
+                    for (T2<ClusterNode, GridDhtPartitionsFullMessage> msg : msgs)
+                        cctx.exchange().processFullPartitionUpdate(msg.get1(), msg.get2());
+                }
             });
         }
-        else
-            delayedLatestMsg.merge(fullMsg, cctx.discovery());
+        else {
+            GridDhtPartitionsFullMessage prev = F.last(delayedFullMsgs).get2();
+
+            if (prev.topologyVersion().equals(fullMsg.topologyVersion()))
+                prev.merge(fullMsg, cctx.discovery());
+            else
+                delayedFullMsgs.add(new T2<>(node, fullMsg));
+        }
 
         return true;
     }
