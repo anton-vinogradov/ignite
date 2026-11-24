@@ -28,9 +28,8 @@ import org.apache.ignite.events.DiscoveryEvent;
 import org.apache.ignite.internal.IgniteEx;
 import org.apache.ignite.internal.TestRecordingCommunicationSpi;
 import org.apache.ignite.internal.processors.affinity.AffinityTopologyVersion;
-import org.apache.ignite.internal.processors.cache.GridCachePartitionExchangeManager;
-import org.apache.ignite.internal.processors.cache.distributed.dht.preloader.GridDhtPartitionsExchangeFuture;
 import org.apache.ignite.internal.processors.cache.distributed.dht.preloader.GridDhtPartitionsFullMessage;
+import org.apache.ignite.internal.util.future.GridFutureAdapter;
 import org.apache.ignite.internal.util.typedef.internal.CU;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
 import org.apache.ignite.util.AttributeNodeFilter;
@@ -38,6 +37,7 @@ import org.junit.Test;
 
 import static org.apache.ignite.cache.PartitionLossPolicy.IGNORE;
 import static org.apache.ignite.cache.PartitionLossPolicy.READ_WRITE_SAFE;
+import static org.apache.ignite.internal.processors.cache.GridCacheIoManager.COMMON_MESSAGE_HANDLER_ID;
 import static org.apache.ignite.testframework.GridTestUtils.mergeExchangeWaitVersion;
 
 /**
@@ -58,23 +58,18 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     /** Partition loss policy of the cache. */
     private PartitionLossPolicy plc;
 
-    /** Whether to exercise delayed refreshes for a named cache group. */
-    private boolean mergedExchange;
-
     /** {@inheritDoc} */
     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
         boolean data = !igniteInstanceName.equals(getTestIgniteInstanceName(NO_DATA));
 
         IgniteConfiguration cfg = super.getConfiguration(igniteInstanceName)
+            .setCommunicationSpi(new TestRecordingCommunicationSpi())
             .setUserAttributes(Collections.singletonMap(DATA_ATTR, data));
-
-        if (mergedExchange)
-            cfg.setCommunicationSpi(new TestRecordingCommunicationSpi());
 
         // A node with the cache in its configuration starts it on join, even outside the node filter.
         return data ? cfg.setCacheConfiguration(new CacheConfiguration<Integer, Integer>(CACHE)
             .setBackups(0)
-            .setGroupName(mergedExchange ? "group" : null)
+            .setGroupName("group")
             .setPartitionLossPolicy(plc)
             .setNodeFilter(new AttributeNodeFilter(DATA_ATTR, true))) : cfg;
     }
@@ -122,7 +117,6 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     @Test
     public void testLostPartitionOwnedInMergedExchange() throws Exception {
         plc = IGNORE;
-        mergedExchange = true;
 
         IgniteEx crd = startGrids(3);
         startClientGrid(3);
@@ -132,55 +126,54 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
 
         assertNull(noData.cachex(CACHE));
 
-        AffinityTopologyVersion resVer = new AffinityTopologyVersion(crd.cluster().topologyVersion() + 2, 0);
-        List<DiscoveryEvent> merged = new ArrayList<>();
-
-        GridCachePartitionExchangeManager<?, ?> exch = crd.context().cache().context().exchange();
         int grpId = crd.cachex(CACHE).context().groupId();
-
-        // Take the map a background refresh would send before the departures.
-        GridDhtPartitionsFullMessage before = exch.createPartitionsFullMessage(null, null, null, null,
-            crd.context().cache().cacheGroups());
-        before.topologyVersion(exch.readyAffinityVersion());
-
+        int departingNodePart = crd.affinity(CACHE).primaryPartitions(grid(2).localNode())[0];
         TestRecordingCommunicationSpi spi = TestRecordingCommunicationSpi.spi(crd);
         ClusterNode observer = noData.localNode();
+        GridFutureAdapter<GridDhtPartitionsFullMessage> regularRefresh = new GridFutureAdapter<>();
+        GridFutureAdapter<GridDhtPartitionsFullMessage> ownerRefresh = new GridFutureAdapter<>();
 
-        spi.blockMessages(GridDhtPartitionsFullMessage.class, noData.name());
-
-        spi.record((node, msg) -> {
-            if (!node.equals(observer) || !(msg instanceof GridDhtPartitionsFullMessage))
+        spi.blockMessages((node, msg) -> {
+            if (!node.equals(observer) || !(msg instanceof GridDhtPartitionsFullMessage full))
                 return false;
 
-            GridDhtPartitionsFullMessage full = (GridDhtPartitionsFullMessage)msg;
+            if (full.exchangeId() == null && full.containsGroup(grpId)) {
+                // A regular refresh includes the utility cache. Only the user cache loses owners.
+                if (full.containsGroup(CU.UTILITY_CACHE_GROUP_ID))
+                    regularRefresh.onDone(full);
+                else
+                    ownerRefresh.onDone(full);
+            }
 
-            // Only the user cache loses owners. A background refresh also includes the utility cache.
-            return full.exchangeId() == null && full.containsGroup(grpId)
-                && !full.containsGroup(CU.UTILITY_CACHE_GROUP_ID);
+            return true;
         });
+
+        crd.context().cache().context().exchange().refreshPartitions();
+        GridDhtPartitionsFullMessage oldMap = regularRefresh.get(getTestTimeout());
+
+        AffinityTopologyVersion resVer = new AffinityTopologyVersion(crd.cluster().topologyVersion() + 2, 0);
+        List<DiscoveryEvent> merged = new ArrayList<>();
 
         mergeExchangeWaitVersion(crd, resVer.topologyVersion(), merged);
 
         stopGrid(getTestIgniteInstanceName(2), true, false);
         stopGrid(getTestIgniteInstanceName(1), true, false);
 
-        exch.affinityReadyFuture(resVer).get(getTestTimeout());
+        GridDhtPartitionsFullMessage ownerUpdate = ownerRefresh.get(getTestTimeout());
 
         assertEquals(1, merged.size());
-
-        List<Object> updates = spi.recordedMessages(true);
-
-        assertEquals(1, updates.size());
-
-        GridDhtPartitionsFullMessage ownerUpdate = (GridDhtPartitionsFullMessage)updates.get(0);
-
         assertEquals(resVer, ownerUpdate.topologyVersion());
 
-        // Deliver both refreshes to the pending exchange before releasing its reply. Other resends could mask a lost update.
-        GridDhtPartitionsExchangeFuture pending = noData.context().cache().context().exchange().lastTopologyFuture();
+        // Deliver both refreshes in order while the exchange reply and any background resends are still blocked.
+        var fullMsgHnd = noData.context().cache().context().io()
+            .cacheHandler(COMMON_MESSAGE_HANDLER_ID, GridDhtPartitionsFullMessage.class);
 
-        assertTrue(pending.addOrMergeDelayedFullMessage(crd.localNode(), before));
-        assertTrue(pending.addOrMergeDelayedFullMessage(crd.localNode(), ownerUpdate));
+        fullMsgHnd.apply(crd.localNode().id(), oldMap);
+        fullMsgHnd.apply(crd.localNode().id(), ownerUpdate);
+
+        assertFalse("The coordinator must become visible as owner only after the exchange reply",
+            noData.context().cache().context().exchange().clientTopologyIfExists(grpId)
+                .owners(departingNodePart).contains(crd.localNode()));
 
         spi.stopBlock(true, m -> ((GridDhtPartitionsFullMessage)m.ioMessage().message()).exchangeId() != null, false, true);
 
