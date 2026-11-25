@@ -1720,67 +1720,77 @@ public class GridCachePartitionExchangeManager<K, V> extends GridCacheSharedMana
     }
 
     /**
-     * @param node Sender cluster node.
-     * @param msg Message.
+     * @param node Sender.
+     * @param msg Full partition map or exchange reply.
      */
     public void processFullPartitionUpdate(ClusterNode node, GridDhtPartitionsFullMessage msg) {
+        if (msg.exchangeId() == null) {
+            // The worker also initializes cache groups and advances their topology during an exchange.
+            exchTaskHandler.addCustomTask(new FullPartitionRefresh(node, msg));
+
+            return;
+        }
+
         if (!enterBusy())
             return;
 
         try {
-            if (msg.exchangeId() == null) {
-                if (log.isDebugEnabled())
-                    log.debug("Received full partition update [node=" + node.id() + ", msg=" + msg + ']');
-
-                boolean updated = false;
-
-                Map<Integer, Map<Integer, Long>> partsSizes = F.emptyIfNull(msg.partitionSizes());
-
-                for (Map.Entry<Integer, GridDhtPartitionFullMap> entry : msg.partitions().entrySet()) {
-                    Integer grpId = entry.getKey();
-
-                    CacheGroupContext grp = cctx.cache().cacheGroup(grpId);
-
-                    GridDhtPartitionTopology top = grp == null ? clientTops.get(grpId) : grp.topology();
-
-                    if (top != null) {
-                        updated |= top.update(null,
-                            entry.getValue(),
-                            null,
-                            msg.partsToReload(cctx.localNodeId(), grpId),
-                            F.emptyIfNull(partsSizes.get(grpId)),
-                            msg.topologyVersion(),
-                            null,
-                            null);
-                    }
-                }
-
-                if (!cctx.kernalContext().clientNode() && updated) {
-                    if (log.isDebugEnabled())
-                        log.debug("Refresh partitions due to topology update");
-
-                    refreshPartitions();
-                }
-
-                boolean hasMovingParts = false;
-
-                for (CacheGroupContext grp : cctx.cache().cacheGroups()) {
-                    if (grp.topology().hasMovingPartitions()) {
-                        hasMovingParts = true;
-
-                        break;
-                    }
-                }
-
-                if (!hasMovingParts)
-                    cctx.database().releaseHistoryForPreloading();
-            }
-            else
-                exchangeFuture(msg.exchangeId(), null, null, null, null).onReceiveFullMessage(node, msg);
+            exchangeFuture(msg.exchangeId(), null, null, null, null).onReceiveFullMessage(node, msg);
         }
         finally {
             leaveBusy();
         }
+    }
+
+    /** Applies a coordinator refresh between exchange worker tasks, when the group's topology is ready. */
+    private void applyFullPartitionRefresh(FullPartitionRefresh refresh) {
+        GridDhtPartitionsFullMessage msg = refresh.msg();
+
+        if (log.isDebugEnabled())
+            log.debug("Received full partition update [node=" + refresh.node().id() + ", msg=" + msg + ']');
+
+        boolean updated = false;
+
+        Map<Integer, Map<Integer, Long>> partsSizes = F.emptyIfNull(msg.partitionSizes());
+
+        for (Map.Entry<Integer, GridDhtPartitionFullMap> entry : msg.partitions().entrySet()) {
+            Integer grpId = entry.getKey();
+
+            CacheGroupContext grp = cctx.cache().cacheGroup(grpId);
+
+            GridDhtPartitionTopology top = grp == null ? clientTops.get(grpId) : grp.topology();
+
+            if (top != null) {
+                updated |= top.update(null,
+                    entry.getValue(),
+                    null,
+                    msg.partsToReload(cctx.localNodeId(), grpId),
+                    F.emptyIfNull(partsSizes.get(grpId)),
+                    msg.topologyVersion(),
+                    null,
+                    null);
+            }
+        }
+
+        if (!cctx.kernalContext().clientNode() && updated) {
+            if (log.isDebugEnabled())
+                log.debug("Refresh partitions due to topology update");
+
+            refreshPartitions();
+        }
+
+        boolean hasMovingParts = false;
+
+        for (CacheGroupContext grp : cctx.cache().cacheGroups()) {
+            if (grp.topology().hasMovingPartitions()) {
+                hasMovingParts = true;
+
+                break;
+            }
+        }
+
+        if (!hasMovingParts)
+            cctx.database().releaseHistoryForPreloading();
     }
 
     /**
@@ -2915,10 +2925,16 @@ public class GridCachePartitionExchangeManager<K, V> extends GridCacheSharedMana
             assert !isExchangeTask(task);
 
             try {
-                cctx.cache().processCustomExchangeTask(task);
+                if (task instanceof FullPartitionRefresh refresh)
+                    applyFullPartitionRefresh(refresh);
+                else
+                    cctx.cache().processCustomExchangeTask(task);
             }
             catch (Exception e) {
                 U.error(log, "Failed to process custom exchange task: " + task, e);
+
+                if (task instanceof FullPartitionRefresh)
+                    cctx.kernalContext().failure().process(new FailureContext(CRITICAL_ERROR, e));
             }
         }
 
@@ -3361,6 +3377,18 @@ public class GridCachePartitionExchangeManager<K, V> extends GridCacheSharedMana
                 return true;
 
             return lastAffinityChangedTopologyVersion(exchFut.topologyVersion()).equals(exchFut.topologyVersion());
+        }
+    }
+
+    /**
+     * @param node Sender.
+     * @param msg Full map sent outside an exchange.
+     */
+    private record FullPartitionRefresh(ClusterNode node, GridDhtPartitionsFullMessage msg)
+        implements CachePartitionExchangeWorkerTask {
+        /** {@inheritDoc} */
+        @Override public boolean skipForExchangeMerge() {
+            return true;
         }
     }
 

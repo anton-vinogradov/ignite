@@ -18,14 +18,23 @@
 package org.apache.ignite.internal.processors.cache.distributed;
 
 import java.util.Collections;
+import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import org.apache.ignite.cache.PartitionLossPolicy;
 import org.apache.ignite.configuration.CacheConfiguration;
 import org.apache.ignite.configuration.IgniteConfiguration;
+import org.apache.ignite.events.CacheEvent;
 import org.apache.ignite.internal.IgniteEx;
+import org.apache.ignite.internal.IgniteInternalFuture;
+import org.apache.ignite.internal.TestRecordingCommunicationSpi;
+import org.apache.ignite.internal.processors.affinity.AffinityTopologyVersion;
+import org.apache.ignite.internal.processors.cache.CacheGroupContext;
 import org.apache.ignite.internal.processors.cache.distributed.dht.preloader.GridDhtPartitionsExchangeFuture;
-import org.apache.ignite.internal.util.typedef.internal.U;
-import org.apache.ignite.testframework.ListeningTestLogger;
-import org.apache.ignite.testframework.LogListener;
+import org.apache.ignite.internal.processors.cache.distributed.dht.preloader.GridDhtPartitionsFullMessage;
+import org.apache.ignite.internal.util.future.GridFutureAdapter;
+import org.apache.ignite.testframework.GridTestUtils;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
 import org.apache.ignite.transactions.Transaction;
 import org.apache.ignite.util.AttributeNodeFilter;
@@ -34,6 +43,10 @@ import org.junit.Test;
 import static org.apache.ignite.cache.CacheAtomicityMode.TRANSACTIONAL;
 import static org.apache.ignite.cache.PartitionLossPolicy.IGNORE;
 import static org.apache.ignite.cache.PartitionLossPolicy.READ_WRITE_SAFE;
+import static org.apache.ignite.events.EventType.EVT_CACHE_STARTED;
+import static org.apache.ignite.internal.GridTopic.TOPIC_CACHE;
+import static org.apache.ignite.internal.processors.cache.GridCacheIoManager.COMMON_MESSAGE_HANDLER_ID;
+import static org.apache.ignite.testframework.GridTestUtils.waitForCondition;
 import static org.apache.ignite.transactions.TransactionConcurrency.PESSIMISTIC;
 import static org.apache.ignite.transactions.TransactionIsolation.REPEATABLE_READ;
 
@@ -55,19 +68,16 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     /** Partition loss policy of the cache. */
     private PartitionLossPolicy plc;
 
-    /** Matches when the server outside the node filter has deferred at least two full maps during an exchange. */
-    private final LogListener deferLsnr =
-        LogListener.matches("Delay process full message without exchange id").atLeast(2).build();
-
     /** {@inheritDoc} */
     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
         boolean data = !igniteInstanceName.equals(getTestIgniteInstanceName(NO_DATA));
 
         IgniteConfiguration cfg = super.getConfiguration(igniteInstanceName)
+            .setCommunicationSpi(new TestRecordingCommunicationSpi())
             .setUserAttributes(Collections.singletonMap(DATA_ATTR, data));
 
         if (!data)
-            return cfg.setGridLogger(new ListeningTestLogger(log, deferLsnr));
+            return cfg;
 
         // A node with the cache in its configuration starts it on join, even outside the node filter.
         return cfg.setCacheConfiguration(new CacheConfiguration<Integer, Integer>(CACHE)
@@ -113,7 +123,7 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     /**
      * Two servers stop while a client transaction is open, so they leave in one merged exchange, and the coordinator
      * becomes the only new owner. A server outside the node filter defers the maps it gets during the exchange: the
-     * coordinator's resend with the initial version and its send at the end of the exchange with the result version.
+     * coordinator's refresh with the initial version and its send at the end of the exchange with the result version.
      * Then it starts the cache and copies the partition map it kept without the cache.
      *
      * @throws Exception If failed.
@@ -122,60 +132,170 @@ public class PartitionStateFromOwnerTest extends GridCommonAbstractTest {
     public void testLostPartitionOwnedInMergedExchange() throws Exception {
         plc = IGNORE;
 
-        // The server outside the node filter defers the map sent at the end of the exchange only if the map comes
-        // before that server finishes its own exchange, so the scenario repeats until it does.
-        for (int i = 0; i < 10; i++) {
-            if (checkMergedExchange())
-                return;
-
-            stopAllGrids();
-        }
-
-        fail("The server outside the node filter deferred fewer than two maps in every run");
-    }
-
-    /**
-     * @return Whether the server outside the node filter deferred at least two maps during the merged exchange.
-     * @throws Exception If failed.
-     */
-    private boolean checkMergedExchange() throws Exception {
         IgniteEx crd = startGrids(3);
         IgniteEx cln = startClientGrid(3);
         IgniteEx noData = startGrid(NO_DATA);
 
         awaitPartitionMapExchange(true, true, null);
 
-        deferLsnr.reset();
+        CacheGroupContext grp = crd.cachex(CACHE).context().group();
 
+        // Hold the exchange reply and background refreshes. Only the two single-group maps may reach this server.
+        TestRecordingCommunicationSpi spi = TestRecordingCommunicationSpi.spi(crd);
+        UUID observerId = noData.localNode().id();
+        spi.blockMessages((node, msg) -> node.id().equals(observerId)
+            && msg instanceof GridDhtPartitionsFullMessage full && !isSingleGroupRefresh(full, grp.groupId()));
+
+        BlockingQueue<AffinityTopologyVersion> received = new LinkedBlockingQueue<>();
+        UUID crdId = crd.localNode().id();
+        noData.context().io().addMessageListener(TOPIC_CACHE, (nodeId, msg, plc) -> {
+            if (crdId.equals(nodeId) && msg instanceof GridDhtPartitionsFullMessage full
+                && isSingleGroupRefresh(full, grp.groupId()))
+                received.add(full.topologyVersion());
+        });
+
+        var crdExch = crd.context().cache().context().exchange();
+        var observerExch = noData.context().cache().context().exchange();
+        AffinityTopologyVersion firstLeave = new AffinityTopologyVersion(crd.cluster().topologyVersion() + 1);
+        AffinityTopologyVersion bothLeft = new AffinityTopologyVersion(firstLeave.topologyVersion() + 1);
         Integer key = primaryKey(crd.cache(CACHE));
+        long timeout = getPartitionMapExchangeTimeout();
 
-        // The exchange waits for the transaction, so the second departure merges into it, and the coordinator's
-        // scheduled resend reaches the server outside the node filter while that server is still in the exchange.
         try (Transaction tx = cln.transactions().txStart(PESSIMISTIC, REPEATABLE_READ)) {
             cln.cache(CACHE).put(key, key);
 
             stopGrid(getTestIgniteInstanceName(2), true, false);
             stopGrid(getTestIgniteInstanceName(1), true, false);
 
-            U.sleep(3_000);
+            noData.context().discovery().topologyFuture(bothLeft.topologyVersion()).get(timeout);
+            assertTrue("The servers did not start the exchange for the first departure", waitForCondition(() ->
+                crdExch.lastTopologyFuture().initialVersion().equals(firstLeave)
+                    && observerExch.lastTopologyFuture().initialVersion().equals(firstLeave), timeout));
+
+            // The transaction holds the exchange while the coordinator sends a refresh with its initial version.
+            crdExch.refreshPartitions(Collections.singleton(grp));
+            assertEquals(firstLeave, received.poll(timeout, TimeUnit.MILLISECONDS));
 
             tx.commit();
         }
 
+        assertEquals(bothLeft, received.poll(timeout, TimeUnit.MILLISECONDS));
+
+        spi.stopBlock(true, m -> ((GridDhtPartitionsFullMessage)m.ioMessage().message()).exchangeId() != null, false, true);
+
         awaitPartitionMapsMatchLocalStates(CACHE);
 
-        GridDhtPartitionsExchangeFuture exchFut = crd.context().cache().context().exchange().lastFinishedFuture();
-
-        assertTrue("The departures didn't merge into one exchange",
-            exchFut.initialVersion().before(exchFut.topologyVersion()));
-
-        boolean deferred = deferLsnr.check();
+        GridDhtPartitionsExchangeFuture exchFut = crdExch.lastFinishedFuture();
+        assertEquals(firstLeave, exchFut.initialVersion());
+        assertEquals(bothLeft, exchFut.topologyVersion());
 
         noData.cache(CACHE);
 
         awaitPartitionMapsMatchLocalStates(CACHE);
+    }
 
-        return deferred;
+    /** A cache opened outside its node filter must see an owner update that arrived during startup. */
+    @Test
+    public void testOwnerUpdateDuringCacheStart() throws Exception {
+        plc = IGNORE;
+
+        IgniteEx crd = startGrids(2);
+        IgniteEx observer = startGrid(NO_DATA);
+        GridDhtPartitionsFullMessage update = holdOwnerUpdateOnServerLeft(crd, observer);
+
+        observer.events().enableLocal(EVT_CACHE_STARTED);
+        observer.events().localListen((CacheEvent evt) -> {
+            if (!CACHE.equals(evt.cacheName()))
+                return true;
+
+            // The group is published. Its DHT topology still needs the map kept before the cache opened.
+            observer.context().cache().context().io()
+                .cacheHandler(COMMON_MESSAGE_HANDLER_ID, GridDhtPartitionsFullMessage.class)
+                .apply(crd.localNode().id(), update);
+
+            return false;
+        }, EVT_CACHE_STARTED);
+
+        observer.cache(CACHE);
+
+        awaitPartitionMapsMatchLocalStates(CACHE);
+    }
+
+    /** An owner update accepted before a client joins must survive the exchange for that join. */
+    @Test
+    public void testOwnerUpdateDuringClientJoin() throws Exception {
+        plc = IGNORE;
+
+        IgniteEx crd = startGrids(2);
+        IgniteEx observer = startGrid(NO_DATA);
+        observer.cache(CACHE);
+
+        UUID crdId = crd.localNode().id();
+        String otherCache = "unopened";
+        crd.getOrCreateCache(new CacheConfiguration<>(otherCache).setNodeFilter(node -> node.id().equals(crdId)));
+
+        GridDhtPartitionsFullMessage update = holdOwnerUpdateOnServerLeft(crd, observer);
+
+        var exch = observer.context().cache().context().exchange();
+        var top = observer.cachex(CACHE).context().topology();
+        var otherTop = exch.clientTopologyIfExists(crd.cachex(otherCache).context().groupId());
+
+        assertNotNull(otherTop);
+
+        IgniteInternalFuture<?> join;
+
+        // The exchange updates DHT topologies before client topologies. Hold it between updating the
+        // cache's topology version and marking that version ready.
+        otherTop.readLock();
+
+        try {
+            join = GridTestUtils.runAsync(() -> startClientGrid(3));
+
+            assertTrue(waitForCondition(() -> top.readyTopologyVersion().before(top.lastTopologyChangeVersion()),
+                getTestTimeout()));
+
+            // Resume a refresh whose receiver checked the previous exchange before the client joined.
+            exch.processFullPartitionUpdate(crd.localNode(), update);
+        }
+        finally {
+            otherTop.readUnlock();
+        }
+
+        join.get(getTestTimeout());
+
+        awaitPartitionMapsMatchLocalStates(CACHE);
+    }
+
+    /** Holds the coordinator's owner update and later resends so they cannot repair the observer's map. */
+    private GridDhtPartitionsFullMessage holdOwnerUpdateOnServerLeft(IgniteEx crd, IgniteEx observer) throws Exception {
+        awaitPartitionMapExchange(true, true, null);
+
+        AffinityTopologyVersion leftVer = new AffinityTopologyVersion(crd.cluster().topologyVersion() + 1);
+        UUID observerId = observer.localNode().id();
+        int grpId = crd.cachex(CACHE).context().groupId();
+        GridFutureAdapter<GridDhtPartitionsFullMessage> ownerUpdate = new GridFutureAdapter<>();
+
+        TestRecordingCommunicationSpi.spi(crd).blockMessages((node, msg) -> {
+            if (!node.id().equals(observerId) || !(msg instanceof GridDhtPartitionsFullMessage full)
+                || full.exchangeId() != null)
+                return false;
+
+            if (isSingleGroupRefresh(full, grpId) && leftVer.equals(full.topologyVersion()))
+                ownerUpdate.onDone(full);
+
+            return true;
+        });
+
+        stopGrid(1);
+
+        observer.context().cache().context().exchange().affinityReadyFuture(leftVer).get(getTestTimeout());
+
+        return ownerUpdate.get(getTestTimeout());
+    }
+
+    /** A periodic refresh also includes the utility cache. */
+    private static boolean isSingleGroupRefresh(GridDhtPartitionsFullMessage full, int grpId) {
+        return full.exchangeId() == null && full.partitions().size() == 1 && full.containsGroup(grpId);
     }
 
     /**

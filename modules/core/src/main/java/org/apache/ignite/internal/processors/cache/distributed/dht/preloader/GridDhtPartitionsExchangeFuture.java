@@ -5224,9 +5224,6 @@ public class GridDhtPartitionsExchangeFuture extends GridDhtTopologyFutureAdapte
             delayedMsgs.add(fullMsg);
 
             listen(f -> {
-                if (f.error() != null)
-                    return;
-
                 List<GridDhtPartitionsFullMessage> msgs;
 
                 synchronized (this) {
@@ -5235,8 +5232,10 @@ public class GridDhtPartitionsExchangeFuture extends GridDhtTopologyFutureAdapte
                     delayedMsgs = null;
                 }
 
-                for (GridDhtPartitionsFullMessage msg : msgs)
-                    cctx.exchange().processFullPartitionUpdate(node, msg);
+                if (f.error() == null) {
+                    for (GridDhtPartitionsFullMessage msg : msgs)
+                        cctx.exchange().processFullPartitionUpdate(node, msg);
+                }
             });
 
             return true;
